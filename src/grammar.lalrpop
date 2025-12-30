@@ -1,5 +1,5 @@
 // =============================================================================
-// GO 1.25 CORE GRAMMAR (Manual Layering - Strict LR1)
+// GO 1.25 GRAMMAR (Conflict-Free Architecture)
 // =============================================================================
 
 use crate::ast::*;
@@ -9,29 +9,26 @@ use lalrpop_util::ErrorRecovery;
 grammar<'err>(errors: &'err mut Vec<ErrorRecovery<usize, Tok, &'static str>>);
 
 // =============================================================================
-// LEXICAL TERMINALS & HELPERS
+// HELPERS
 // =============================================================================
 
 Semi: () = ";" => ();
 Ident: String = "IDENT" => <>;
 
 // =============================================================================
-// EXPRESSION HIERARCHY (Manual Precedence 1-5)
+// EXPRESSION HIERARCHY
 // =============================================================================
 
-// Level 5: Logical OR (||) - Lowest Precedence
 pub Expression: Expr = {
     <l:Expression> "||" <r:Expr4> => Expr::Binary(Box::new(l), BinaryOp::OrOr, Box::new(r)),
     Expr4,
 };
 
-// Level 4: Logical AND (&&)
 Expr4: Expr = {
     <l:Expr4> "&&" <r:Expr3> => Expr::Binary(Box::new(l), BinaryOp::AndAnd, Box::new(r)),
     Expr3,
 };
 
-// Level 3: Comparisons (==, !=, <, <=, >, >=)
 Expr3: Expr = {
     <l:Expr3> "==" <r:Expr2> => Expr::Binary(Box::new(l), BinaryOp::Eq, Box::new(r)),
     <l:Expr3> "!=" <r:Expr2> => Expr::Binary(Box::new(l), BinaryOp::Ne, Box::new(r)),
@@ -42,7 +39,6 @@ Expr3: Expr = {
     Expr2,
 };
 
-// Level 2: Additive (+, -, |, ^)
 Expr2: Expr = {
     <l:Expr2> "+" <r:Expr1> => Expr::Binary(Box::new(l), BinaryOp::Add, Box::new(r)),
     <l:Expr2> "-" <r:Expr1> => Expr::Binary(Box::new(l), BinaryOp::Sub, Box::new(r)),
@@ -51,7 +47,6 @@ Expr2: Expr = {
     Expr1,
 };
 
-// Level 1: Multiplicative (*, /, %, <<, >>, &, &^)
 Expr1: Expr = {
     <l:Expr1> "*"  <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::Mul, Box::new(r)),
     <l:Expr1> "/"  <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::Div, Box::new(r)),
@@ -63,104 +58,92 @@ Expr1: Expr = {
     UnaryExpr,
 };
 
-// =============================================================================
-// UNARY & PRIMARY EXPRESSIONS (The Core)
-// =============================================================================
-
-// Level 0: Unary Operators (Right Associative)
 UnaryExpr: Expr = {
     "+" <e:UnaryExpr> => Expr::Unary(UnaryOp::Pos, Box::new(e)),
     "-" <e:UnaryExpr> => Expr::Unary(UnaryOp::Neg, Box::new(e)),
     "!" <e:UnaryExpr> => Expr::Unary(UnaryOp::Not, Box::new(e)),
     "^" <e:UnaryExpr> => Expr::Unary(UnaryOp::Xor, Box::new(e)),
     "&" <e:UnaryExpr> => Expr::Unary(UnaryOp::Addr, Box::new(e)),
-    
-    // Puntero y Receive se manejan como nodos ambiguos inicialmente
-    // para unificarlos con el resto de TypeOrExpr.
-    "*" <e:UnaryExpr> => {
-        // Envolvemos en nodo ambiguo Star para permitir que sea (*T) o (*x)
-        // Esto asume que Expr puede contener nodos ambiguos (TypeOrExpr wrapper)
-        // Si tu Expr es estricta, aquí debes crear un Expr::Unary(Star, e)
-        // Y en la fase semántica distinguir si era puntero a tipo.
-        Expr::Unary(UnaryOp::Star, Box::new(e))
-    },
     "<-" <e:UnaryExpr> => Expr::Unary(UnaryOp::Recv, Box::new(e)),
-    
-    // Bajamos al nivel atómico
-    PrimaryExpr,
-};
-
-// Primary Expressions (Selectores, Indices, Llamadas, Literales)
-// Aquí es donde vive la lógica TypeOrExpr "inlined".
-PrimaryExpr: Expr = {
-    <atom:Operand> => atom,
-
-    // Selector: x.f
-    <base:PrimaryExpr> "." <sel:Ident> => 
-        Expr::Selector(Box::new(base), sel),
-
-    // Type Assertion: x.(T) - Requiere Lookahead manual o regla específica
-    <base:PrimaryExpr> "." "(" <t:Type> ")" => 
-        Expr::TypeAssert(Box::new(base), Some(t)),
-    
-    <base:PrimaryExpr> "." "(" "type" ")" => 
-        Expr::TypeSwitchGuard(Box::new(base)),
-
-    // Index / Generic: x[i]
-    <base:PrimaryExpr> "[" <args:IndexArgs> "]" => 
-        Expr::Index(Box::new(base), args), // args es Vec<Expr> (ambiguos)
-
-    // Slice: x[i:j]
-    <base:PrimaryExpr> "[" <l:Expression?> ":" <h:Expression?> "]" =>
-        Expr::Slice(Box::new(base), l.map(Box::new), h.map(Box::new), None),
-    
-    <base:PrimaryExpr> "[" <l:Expression?> ":" <h:Expression> ":" <m:Expression> "]" =>
-        Expr::Slice(Box::new(base), l.map(Box::new), Some(Box::new(h)), Some(Box::new(m))),
-
-    // Call / Conversion: f(x)
-    <base:PrimaryExpr> "(" <args:CallArgs> <dot:"..."?> ")" => 
-        Expr::Call(Box::new(base), args, dot.is_some()),
-        
-    // Composite Literal: T{...}
-    // Para evitar conflicto, solo permitimos Operand como base del literal compuesto aquí,
-    // o PrimaryExpr si LALRPOP lo soporta (shift/reduce check).
-    // Si da conflicto, restringir a Operand o TypeLit.
-    <t:Operand> <v:LiteralValue> =>? {
-        // Validación semántica: 't' debe ser un tipo
-        Ok(Expr::CompositeLit { typ: t.to_type_check()?, elements: v })
-    }
-};
-
-Operand: Expr = {
-    <l:BasicLit> => Expr::BasicLit(l),
-    <id:Ident> => Expr::Ident(id),
-    "(" <e:Expression> ")" => Expr::Paren(Box::new(e)),
-    <f:FunctionLit> => f,
-    
-    // Tipos literales usados como expresión (Composite Lits anónimos)
-    <t:LiteralType> => Expr::TypeWrapper(t),
+    // Pointer/Dereference handled in TypeOrExpr
+    <t:TypeOrExpr> =>? t.to_expr_or_error(),
 };
 
 // =============================================================================
-// LISTS (Explicit to avoid conflicts)
+// TYPE OR EXPR (The Ambiguous Core)
 // =============================================================================
 
-// Index Args: Can be [a] (Index) or [int] (Generic Instantiation)
-// Parsed as Expr list.
-IndexArgs: Vec<Expr> = {
-    <e:Expression> => vec![e],
-    <mut v:IndexArgs> "," <e:Expression> => { v.push(e); v },
+TypeOrExpr: TypeOrExpr = {
+    // Postfix Operations
+    <base:TypeOrExpr> "." <sel:Ident> => 
+        TypeOrExpr::Ambiguous(AmbiguousNode::Selector(Box::new(base), sel)),
+
+    <base:TypeOrExpr> "[" <args:GenericArgsList> "]" => 
+        TypeOrExpr::Ambiguous(AmbiguousNode::IndexOrGeneric(Box::new(base), args)),
+
+    <base:TypeOrExpr> "(" <args:CallArgsList> <dot:"..."?> ")" => 
+        TypeOrExpr::Ambiguous(AmbiguousNode::CallOrConversion(Box::new(base), args, dot.is_some())),
+
+    // Slices (Explicit disambiguation from Index)
+    <base:TypeOrExpr> "[" <l:Expression?> ":" <h:Expression?> "]" =>? {
+        let b = base.to_expr_or_error()?;
+        Ok(TypeOrExpr::Expr(Expr::Slice(Box::new(b), l.map(Box::new), h.map(Box::new), None)))
+    },
+    <base:TypeOrExpr> "[" <l:Expression?> ":" <h:Expression> ":" <m:Expression> "]" =>? {
+        let b = base.to_expr_or_error()?;
+        Ok(TypeOrExpr::Expr(Expr::Slice(Box::new(b), l.map(Box::new), Some(Box::new(h)), Some(Box::new(m)))))
+    },
+
+    // Type Assertion / Switch Guard
+    <base:TypeOrExpr> "." "(" <t:Type> ")" =>? {
+        let b = base.to_expr_or_error()?;
+        Ok(TypeOrExpr::Expr(Expr::TypeAssert(Box::new(b), Some(t))))
+    },
+    <base:TypeOrExpr> "." "(" "type" ")" =>? {
+        let b = base.to_expr_or_error()?;
+        Ok(TypeOrExpr::Expr(Expr::TypeSwitchGuard(Box::new(b))))
+    },
+
+    // Composite Literal
+    <t:TypeOrExprAtom> <v:LiteralValue> =>? {
+        let typ = t.to_type_for_composite_lit()?;
+        Ok(TypeOrExpr::Expr(Expr::CompositeLit { typ, elements: v }))
+    },
+
+    // Prefix '*' (Star) - Ambiguous (Pointer Type vs Dereference)
+    "*" <t:TypeOrExpr> => TypeOrExpr::Ambiguous(AmbiguousNode::Star(Box::new(t))),
+
+    TypeOrExprAtom,
 };
 
-// Call Args: Allows trailing comma
-CallArgs: Vec<Expr> = {
-    => vec![],
-    <mut v:CallArgsInner> ","? => v,
+TypeOrExprAtom: TypeOrExpr = {
+    <id:Ident> => TypeOrExpr::Ambiguous(AmbiguousNode::Ident(id)),
+    <l:BasicLit> => TypeOrExpr::Expr(Expr::BasicLit(l)),
+    <f:FunctionLit> => TypeOrExpr::Expr(f),
+    "(" <e:TypeOrExpr> ")" => TypeOrExpr::Ambiguous(AmbiguousNode::Paren(Box::new(e))),
+    
+    // Explicit Types
+    <t:LiteralType> => TypeOrExpr::Type(t),
+    "chan" "<-" <elem:Type> => TypeOrExpr::Type(Type::Chan(ChanDir::Recv, Box::new(elem))),
+    "chan" <elem:Type> => TypeOrExpr::Type(Type::Chan(ChanDir::Both, Box::new(elem))),
+    "<-" "chan" <elem:Type> => TypeOrExpr::Type(Type::Chan(ChanDir::Recv, Box::new(elem))),
 };
 
-CallArgsInner: Vec<Expr> = {
+// =============================================================================
+// LISTS (Manual Recursion)
+// =============================================================================
+
+GenericArgsList: Vec<TypeOrExpr> = {
+    <e:TypeOrExpr> => vec![e],
+    <mut v:GenericArgsList> "," <e:TypeOrExpr> => { v.push(e); v },
+    => vec![] 
+};
+
+CallArgsList: Vec<Expr> = {
     <e:Expression> => vec![e],
-    <mut v:CallArgsInner> "," <e:Expression> => { v.push(e); v }
+    <mut v:CallArgsList> "," <e:Expression> => { v.push(e); v },
+    <v:CallArgsList> "," => v, 
+    => vec![] 
 };
 
 // =============================================================================
@@ -168,23 +151,8 @@ CallArgsInner: Vec<Expr> = {
 // =============================================================================
 
 Type: Type = {
-    // Si empieza con Nombre, puede ser un tipo nombrado
-    <id:Ident> => Type::Named(id),
-    <pkg:Ident> "." <name:Ident> => Type::Qualified(pkg, name),
-    
-    // Tipos literales
+    <t:TypeOrExpr> =>? t.to_type_or_error(),
     <t:LiteralType> => t,
-    
-    // Puntero
-    "*" <t:Type> => Type::Pointer(Box::new(t)),
-    
-    // Paréntesis
-    "(" <t:Type> ")" => Type::Paren(Box::new(t)),
-    
-    // Canales (Orden estricto)
-    "chan" "<-" <elem:Type> => Type::Chan(ChanDir::Send, Box::new(elem)),
-    "<-" "chan" <elem:Type> => Type::Chan(ChanDir::Recv, Box::new(elem)),
-    "chan" <elem:Type> => Type::Chan(ChanDir::Both, Box::new(elem)),
 };
 
 LiteralType: Type = {
@@ -200,20 +168,28 @@ ArrayType: Type = { "[" <len:Expression> "]" <elem:Type> => Type::Array(Box::new
 SliceType: Type = { "[" "]" <elem:Type> => Type::Slice(Box::new(elem)) };
 MapType: Type = { "map" "[" <k:Type> "]" <v:Type> => Type::Map(Box::new(k), Box::new(v)) };
 
+// STRUCT: Resolver conflicto Ident vs Ident Type
 StructType: Type = { "struct" "{" <fields:FieldDeclList> "}" => Type::Struct(fields) };
 
-// Struct Fields List (Semicolon terminated)
 FieldDeclList: Vec<Field> = {
     => vec![],
     <mut v:FieldDeclList> <f:FieldDecl> Semi => { v.push(f); v }
 };
 
 FieldDecl: Field = {
-    // Conflicto IdentifierList vs Type resuelto:
-    // Parseamos Identifiers y luego Type. 
-    // Si Type es un Ident, LALRPOP usa lookahead para ver el StringLit (tag).
+    // 1. "Ident, Ident Type Tag"
     <names:IdentifierList> <t:Type> <tag:StringLit?> => Field { names, typ: t, tag },
-    <t:Type> <tag:StringLit?> => Field { names: vec![], typ: t, tag }, // Embedded
+    // 2. Embedded Field: "*T" or "T" or "pkg.T"
+    <t:EmbeddedFieldType> <tag:StringLit?> => Field { names: vec![], typ: t, tag },
+};
+
+// Embedded fields must be TypeName or *TypeName
+EmbeddedFieldType: Type = {
+    <t:TypeOrExprAtom> =>? t.to_type_or_error(), // Ident, Selector
+    "*" <t:TypeOrExprAtom> =>? {
+        let inner = t.to_type_or_error()?;
+        Ok(Type::Pointer(Box::new(inner)))
+    }
 };
 
 IdentifierList: Vec<String> = {
@@ -221,6 +197,7 @@ IdentifierList: Vec<String> = {
     <mut v:IdentifierList> "," <i:Ident> => { v.push(i); v }
 };
 
+// INTERFACE: Resolver conflicto Method vs Embedded Type
 InterfaceType: Type = { "interface" "{" <elems:InterfaceElemList> "}" => Type::Interface(elems) };
 
 InterfaceElemList: Vec<InterfaceElem> = {
@@ -229,7 +206,11 @@ InterfaceElemList: Vec<InterfaceElem> = {
 };
 
 InterfaceElem: InterfaceElem = {
+    // Caso 1: Método "Method(Args)..."
     <id:Ident> <sig:Signature> => InterfaceElem::Method(id, sig),
+    // Caso 2: Embedded Interface "Type" (Puede ser un Ident)
+    // Para desambiguar, si LALRPOP ve Ident seguido de '(', toma el camino Method.
+    // Si no, toma el camino Type.
     <t:Type> => InterfaceElem::Embed(t),
 };
 
@@ -245,51 +226,27 @@ Signature: Signature = {
     <params:Parameters> <res:Result?> => Signature { params, results: res.unwrap_or_default() }
 };
 
-// SOLUCIÓN AL CONFLICTO DE PARÁMETROS:
-// Parseamos todo como una lista de "ParameterElement" genéricos y luego Rust decide.
-// Un ParameterElement puede ser: "a", "a, b", "int", "a int".
-// Como esto es muy ambiguo en gramática, usamos la estrategia:
-// 1. Parsear lista de (IdentifierList + Type?)
-// Si no hay Type, son tipos anónimos.
 Parameters: Vec<Field> = { 
-    "(" <params:ParameterList> ")" => params
+    "(" <raw:ParameterList> ")" =>? Ok(crate::ast::utils::finalize_parameters(raw)?)
 };
 
-ParameterList: Vec<Field> = {
+ParameterList: Vec<TypeOrExpr> = {
     => vec![],
     <mut v:ParameterListInner> ","? => v,
 };
 
-// ParameterList es la parte más difícil. Usamos una simplificación:
-// Aceptamos `Decl` (names Type) o `Type` (anonymous).
-// Como `Type` puede empezar por `Ident`, hay conflicto.
-// Truco: Permitimos que `Type` consuma el Ident.
-ParameterListInner: Vec<Field> = {
-    <p:ParameterDecl> => vec![p],
-    <mut v:ParameterListInner> "," <p:ParameterDecl> => { v.push(p); v }
+ParameterListInner: Vec<TypeOrExpr> = {
+    <e:ParameterItem> => vec![e],
+    <mut v:ParameterListInner> "," <e:ParameterItem> => { v.push(e); v }
 };
 
-ParameterDecl: Field = {
-    // Intenta parsear "a, b Type".
-    // Si falla (porque no hay coma), intenta "Type".
-    <names:IdentifierList> <dot:"..."?> <t:Type> => {
-        // Aquí hay ambigüedad si IdentifierList tiene un solo elemento 'a' y 'Type' es 'int'.
-        // Go permite 'func(int)' y 'func(a int)'.
-        // LALRPOP shift/reduce preferirá la cadena más larga.
-        let typ = if dot.is_some() { Type::Variadic(Box::new(t)) } else { t };
-        Field { names, typ, tag: None }
-    },
-    // Caso fallback para tipos anónimos o cuando IdentifierList falló por ser un solo Ident que era Type.
-    // LALRPOP intentará la regla anterior primero.
-    <dot:"..."?> <t:Type> => {
-        let typ = if dot.is_some() { Type::Variadic(Box::new(t)) } else { t };
-        Field::anonymous(typ)
-    }
+ParameterItem: TypeOrExpr = {
+    <t:TypeOrExpr> <dot:"..."?> => if dot.is_some() { t /* Variadic flag */ } else { t } 
 };
 
 Result: Vec<Field> = {
     <t:Type> => vec![Field::anonymous(t)],
-    "(" <params:ParameterList> ")" => params
+    "(" <raw:ParameterList> ")" =>? Ok(crate::ast::utils::finalize_parameters(raw)?)
 };
 
 LiteralValue: Vec<Element> = { "{" <es:LiteralElementsList> "}" => es };
@@ -305,10 +262,15 @@ LiteralElementsInner: Vec<Element> = {
 };
 
 Element: Element = {
-    // Usamos Expression para key y value. Precedencia ":" es muy baja.
-    <k:Expr2> ":" <v:Expression> => Element::KeyValue(k, v), // Expr2 evita conflicto con literal struct anidado
+    // Restringimos Key a Expr5 (Unary) para evitar conflicto con ":" de slice
+    // aunque en un literal compuesto no hay ambigüedad real de slice, ayuda al parser.
+    <k:Expression> ":" <v:Expression> => Element::KeyValue(k, v),
     <v:Expression> => Element::Val(v)
 };
+
+// =============================================================================
+// LEXER & UTILS
+// =============================================================================
 
 BasicLit: BasicLit = {
     <s:"INT"> => BasicLit { kind: BasicLitKind::Int, raw: s },
@@ -319,10 +281,6 @@ BasicLit: BasicLit = {
 };
 
 Block: Block = { "{" "}" => Block(vec![]) }; 
-
-// =============================================================================
-// LEXER
-// =============================================================================
 
 extern {
     type Location = usize;
