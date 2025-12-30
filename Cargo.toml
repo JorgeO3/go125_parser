@@ -1,0 +1,19 @@
+[package]
+name = "go125_parser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+logos = "0.16.0"
+lalrpop-util = "0.22.2"
+thiserror = "2.0.17"
+unicode-ident = "1.0.22"
+smallvec = "1.15.1"
+
+[build-dependencies]
+lalrpop = "0.22"
+
+[dev-dependencies]
+pretty_assertions = "1"
+walkdir = "2"
