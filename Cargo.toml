@@ -17,3 +17,7 @@ lalrpop = "0.22"
 [dev-dependencies]
 pretty_assertions = "1"
 walkdir = "2"
+
+[profile.dev.build-override]
+opt-level = 3
+debug = 0

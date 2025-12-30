@@ -1,725 +1,313 @@
+// =============================================================================
+// GO 1.25 CORE GRAMMAR (Manual Layering - Strict LR1)
+// =============================================================================
+
 use crate::ast::*;
 use crate::lexer::Tok;
 use lalrpop_util::ErrorRecovery;
 
 grammar<'err>(errors: &'err mut Vec<ErrorRecovery<usize, Tok, &'static str>>);
 
-extern {
-    type Location = usize;
-    type Error = &'static str;
-
-    enum Tok {
-        "IDENT" => Tok::Ident(<String>),
-        "INT" => Tok::IntLit(<String>),
-        "FLOAT" => Tok::FloatLit(<String>),
-        "IMAG" => Tok::ImagLit(<String>),
-        "RUNE" => Tok::RuneLit(<String>),
-        "STRING" => Tok::StringLit(<String>),
-        "RAW_STRING" => Tok::RawStringLit(<String>),
-
-        "break" => Tok::KwBreak,
-        "default" => Tok::KwDefault,
-        "func" => Tok::KwFunc,
-        "interface" => Tok::KwInterface,
-        "select" => Tok::KwSelect,
-        "case" => Tok::KwCase,
-        "defer" => Tok::KwDefer,
-        "go" => Tok::KwGo,
-        "map" => Tok::KwMap,
-        "struct" => Tok::KwStruct,
-        "chan" => Tok::KwChan,
-        "else" => Tok::KwElse,
-        "goto" => Tok::KwGoto,
-        "package" => Tok::KwPackage,
-        "switch" => Tok::KwSwitch,
-        "const" => Tok::KwConst,
-        "fallthrough" => Tok::KwFallthrough,
-        "if" => Tok::KwIf,
-        "range" => Tok::KwRange,
-        "type" => Tok::KwType,
-        "continue" => Tok::KwContinue,
-        "for" => Tok::KwFor,
-        "import" => Tok::KwImport,
-        "return" => Tok::KwReturn,
-        "var" => Tok::KwVar,
-
-        "..." => Tok::Ellipsis,
-
-        "<<=" => Tok::ShlAssign,
-        ">>=" => Tok::ShrAssign,
-        "&^=" => Tok::AndNotAssign,
-
-        "+=" => Tok::AddAssign,
-        "-=" => Tok::SubAssign,
-        "*=" => Tok::MulAssign,
-        "/=" => Tok::DivAssign,
-        "%=" => Tok::ModAssign,
-        "&=" => Tok::AndAssign,
-        "|=" => Tok::OrAssign,
-        "^=" => Tok::XorAssign,
-
-        "<<" => Tok::Shl,
-        ">>" => Tok::Shr,
-        "&^" => Tok::AndNot,
-
-        "&&" => Tok::LAnd,
-        "||" => Tok::LOr,
-
-        "==" => Tok::EqEq,
-        "!=" => Tok::NotEq,
-        "<=" => Tok::Le,
-        ">=" => Tok::Ge,
-
-        "++" => Tok::Inc,
-        "--" => Tok::Dec,
-
-        ":=" => Tok::Define,
-        "<-" => Tok::Arrow,
-
-        "=" => Tok::Assign,
-        "+" => Tok::Plus,
-        "-" => Tok::Minus,
-        "*" => Tok::Star,
-        "/" => Tok::Slash,
-        "%" => Tok::Percent,
-        "&" => Tok::Amp,
-        "|" => Tok::Pipe,
-        "^" => Tok::Caret,
-        "~" => Tok::Tilde,
-        "!" => Tok::Bang,
-        "<" => Tok::Lt,
-        ">" => Tok::Gt,
-
-        "(" => Tok::LParen,
-        ")" => Tok::RParen,
-        "[" => Tok::LBrack,
-        "]" => Tok::RBrack,
-        "{" => Tok::LBrace,
-        "}" => Tok::RBrace,
-
-        "," => Tok::Comma,
-        ";" => Tok::Semi,
-        ":" => Tok::Colon,
-        "." => Tok::Dot,
-    }
-}
-
-// --------------------------
-// Common terminals
-// --------------------------
+// =============================================================================
+// LEXICAL TERMINALS & HELPERS
+// =============================================================================
 
 Semi: () = ";" => ();
+Ident: String = "IDENT" => <>;
 
-Ident: Ident = <s:"IDENT"> => s;
+// =============================================================================
+// EXPRESSION HIERARCHY (Manual Precedence 1-5)
+// =============================================================================
 
-IdentifierList: Vec<Ident> = {
-    <first:Ident> <rest:("," <Ident>)*> ","? => {
-        let mut v = vec![first];
-        v.extend(rest);
-        v
+// Level 5: Logical OR (||) - Lowest Precedence
+pub Expression: Expr = {
+    <l:Expression> "||" <r:Expr4> => Expr::Binary(Box::new(l), BinaryOp::OrOr, Box::new(r)),
+    Expr4,
+};
+
+// Level 4: Logical AND (&&)
+Expr4: Expr = {
+    <l:Expr4> "&&" <r:Expr3> => Expr::Binary(Box::new(l), BinaryOp::AndAnd, Box::new(r)),
+    Expr3,
+};
+
+// Level 3: Comparisons (==, !=, <, <=, >, >=)
+Expr3: Expr = {
+    <l:Expr3> "==" <r:Expr2> => Expr::Binary(Box::new(l), BinaryOp::Eq, Box::new(r)),
+    <l:Expr3> "!=" <r:Expr2> => Expr::Binary(Box::new(l), BinaryOp::Ne, Box::new(r)),
+    <l:Expr3> "<"  <r:Expr2> => Expr::Binary(Box::new(l), BinaryOp::Lt, Box::new(r)),
+    <l:Expr3> "<=" <r:Expr2> => Expr::Binary(Box::new(l), BinaryOp::Le, Box::new(r)),
+    <l:Expr3> ">"  <r:Expr2> => Expr::Binary(Box::new(l), BinaryOp::Gt, Box::new(r)),
+    <l:Expr3> ">=" <r:Expr2> => Expr::Binary(Box::new(l), BinaryOp::Ge, Box::new(r)),
+    Expr2,
+};
+
+// Level 2: Additive (+, -, |, ^)
+Expr2: Expr = {
+    <l:Expr2> "+" <r:Expr1> => Expr::Binary(Box::new(l), BinaryOp::Add, Box::new(r)),
+    <l:Expr2> "-" <r:Expr1> => Expr::Binary(Box::new(l), BinaryOp::Sub, Box::new(r)),
+    <l:Expr2> "|" <r:Expr1> => Expr::Binary(Box::new(l), BinaryOp::Or, Box::new(r)),
+    <l:Expr2> "^" <r:Expr1> => Expr::Binary(Box::new(l), BinaryOp::Xor, Box::new(r)),
+    Expr1,
+};
+
+// Level 1: Multiplicative (*, /, %, <<, >>, &, &^)
+Expr1: Expr = {
+    <l:Expr1> "*"  <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::Mul, Box::new(r)),
+    <l:Expr1> "/"  <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::Div, Box::new(r)),
+    <l:Expr1> "%"  <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::Mod, Box::new(r)),
+    <l:Expr1> "<<" <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::Shl, Box::new(r)),
+    <l:Expr1> ">>" <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::Shr, Box::new(r)),
+    <l:Expr1> "&"  <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::And, Box::new(r)),
+    <l:Expr1> "&^" <r:UnaryExpr> => Expr::Binary(Box::new(l), BinaryOp::AndNot, Box::new(r)),
+    UnaryExpr,
+};
+
+// =============================================================================
+// UNARY & PRIMARY EXPRESSIONS (The Core)
+// =============================================================================
+
+// Level 0: Unary Operators (Right Associative)
+UnaryExpr: Expr = {
+    "+" <e:UnaryExpr> => Expr::Unary(UnaryOp::Pos, Box::new(e)),
+    "-" <e:UnaryExpr> => Expr::Unary(UnaryOp::Neg, Box::new(e)),
+    "!" <e:UnaryExpr> => Expr::Unary(UnaryOp::Not, Box::new(e)),
+    "^" <e:UnaryExpr> => Expr::Unary(UnaryOp::Xor, Box::new(e)),
+    "&" <e:UnaryExpr> => Expr::Unary(UnaryOp::Addr, Box::new(e)),
+    
+    // Puntero y Receive se manejan como nodos ambiguos inicialmente
+    // para unificarlos con el resto de TypeOrExpr.
+    "*" <e:UnaryExpr> => {
+        // Envolvemos en nodo ambiguo Star para permitir que sea (*T) o (*x)
+        // Esto asume que Expr puede contener nodos ambiguos (TypeOrExpr wrapper)
+        // Si tu Expr es estricta, aquí debes crear un Expr::Unary(Star, e)
+        // Y en la fase semántica distinguir si era puntero a tipo.
+        Expr::Unary(UnaryOp::Star, Box::new(e))
+    },
+    "<-" <e:UnaryExpr> => Expr::Unary(UnaryOp::Recv, Box::new(e)),
+    
+    // Bajamos al nivel atómico
+    PrimaryExpr,
+};
+
+// Primary Expressions (Selectores, Indices, Llamadas, Literales)
+// Aquí es donde vive la lógica TypeOrExpr "inlined".
+PrimaryExpr: Expr = {
+    <atom:Operand> => atom,
+
+    // Selector: x.f
+    <base:PrimaryExpr> "." <sel:Ident> => 
+        Expr::Selector(Box::new(base), sel),
+
+    // Type Assertion: x.(T) - Requiere Lookahead manual o regla específica
+    <base:PrimaryExpr> "." "(" <t:Type> ")" => 
+        Expr::TypeAssert(Box::new(base), Some(t)),
+    
+    <base:PrimaryExpr> "." "(" "type" ")" => 
+        Expr::TypeSwitchGuard(Box::new(base)),
+
+    // Index / Generic: x[i]
+    <base:PrimaryExpr> "[" <args:IndexArgs> "]" => 
+        Expr::Index(Box::new(base), args), // args es Vec<Expr> (ambiguos)
+
+    // Slice: x[i:j]
+    <base:PrimaryExpr> "[" <l:Expression?> ":" <h:Expression?> "]" =>
+        Expr::Slice(Box::new(base), l.map(Box::new), h.map(Box::new), None),
+    
+    <base:PrimaryExpr> "[" <l:Expression?> ":" <h:Expression> ":" <m:Expression> "]" =>
+        Expr::Slice(Box::new(base), l.map(Box::new), Some(Box::new(h)), Some(Box::new(m))),
+
+    // Call / Conversion: f(x)
+    <base:PrimaryExpr> "(" <args:CallArgs> <dot:"..."?> ")" => 
+        Expr::Call(Box::new(base), args, dot.is_some()),
+        
+    // Composite Literal: T{...}
+    // Para evitar conflicto, solo permitimos Operand como base del literal compuesto aquí,
+    // o PrimaryExpr si LALRPOP lo soporta (shift/reduce check).
+    // Si da conflicto, restringir a Operand o TypeLit.
+    <t:Operand> <v:LiteralValue> =>? {
+        // Validación semántica: 't' debe ser un tipo
+        Ok(Expr::CompositeLit { typ: t.to_type_check()?, elements: v })
     }
 };
 
-ExpressionList: Vec<Expr> = {
-    <first:Expression> <rest:("," <Expression>)*> ","? => {
-        let mut v = vec![first];
-        v.extend(rest);
-        v
-    }
+Operand: Expr = {
+    <l:BasicLit> => Expr::BasicLit(l),
+    <id:Ident> => Expr::Ident(id),
+    "(" <e:Expression> ")" => Expr::Paren(Box::new(e)),
+    <f:FunctionLit> => f,
+    
+    // Tipos literales usados como expresión (Composite Lits anónimos)
+    <t:LiteralType> => Expr::TypeWrapper(t),
 };
 
-ExpressionListOpt: Vec<Expr> = {
-    ExpressionList,
+// =============================================================================
+// LISTS (Explicit to avoid conflicts)
+// =============================================================================
+
+// Index Args: Can be [a] (Index) or [int] (Generic Instantiation)
+// Parsed as Expr list.
+IndexArgs: Vec<Expr> = {
+    <e:Expression> => vec![e],
+    <mut v:IndexArgs> "," <e:Expression> => { v.push(e); v },
+};
+
+// Call Args: Allows trailing comma
+CallArgs: Vec<Expr> = {
     => vec![],
+    <mut v:CallArgsInner> ","? => v,
 };
 
-TypeList: Vec<Type> = {
-    <first:Type> <rest:("," <Type>)*> ","? => {
-        let mut v = vec![first];
-        v.extend(rest);
-        v
-    }
+CallArgsInner: Vec<Expr> = {
+    <e:Expression> => vec![e],
+    <mut v:CallArgsInner> "," <e:Expression> => { v.push(e); v }
 };
 
-// --------------------------
-// Source file
-// --------------------------
+// =============================================================================
+// TYPES
+// =============================================================================
 
-pub SourceFile: SourceFile = {
-    <pkg:PackageClause> <imports:ImportDecls> <decls:TopLevelDecls> => {
-        SourceFile { package_name: pkg, imports, decls }
-    }
+Type: Type = {
+    // Si empieza con Nombre, puede ser un tipo nombrado
+    <id:Ident> => Type::Named(id),
+    <pkg:Ident> "." <name:Ident> => Type::Qualified(pkg, name),
+    
+    // Tipos literales
+    <t:LiteralType> => t,
+    
+    // Puntero
+    "*" <t:Type> => Type::Pointer(Box::new(t)),
+    
+    // Paréntesis
+    "(" <t:Type> ")" => Type::Paren(Box::new(t)),
+    
+    // Canales (Orden estricto)
+    "chan" "<-" <elem:Type> => Type::Chan(ChanDir::Send, Box::new(elem)),
+    "<-" "chan" <elem:Type> => Type::Chan(ChanDir::Recv, Box::new(elem)),
+    "chan" <elem:Type> => Type::Chan(ChanDir::Both, Box::new(elem)),
 };
 
-PackageClause: Ident = {
-    "package" <name:Ident> <Semi?> => name
+LiteralType: Type = {
+    <t:ArrayType> => t,
+    <t:StructType> => t,
+    <t:SliceType> => t,
+    <t:MapType> => t,
+    <t:InterfaceType> => t,
+    "func" <sig:Signature> => Type::Func(sig),
 };
 
-ImportDecls: Vec<ImportSpec> = {
-    <decls:ImportDecl*> => decls.into_iter().flatten().collect(),
+ArrayType: Type = { "[" <len:Expression> "]" <elem:Type> => Type::Array(Box::new(len), Box::new(elem)) };
+SliceType: Type = { "[" "]" <elem:Type> => Type::Slice(Box::new(elem)) };
+MapType: Type = { "map" "[" <k:Type> "]" <v:Type> => Type::Map(Box::new(k), Box::new(v)) };
+
+StructType: Type = { "struct" "{" <fields:FieldDeclList> "}" => Type::Struct(fields) };
+
+// Struct Fields List (Semicolon terminated)
+FieldDeclList: Vec<Field> = {
+    => vec![],
+    <mut v:FieldDeclList> <f:FieldDecl> Semi => { v.push(f); v }
 };
 
-ImportDecl: Vec<ImportSpec> = {
-    "import" <specs:ImportSpecGroup> <Semi?> => specs
+FieldDecl: Field = {
+    // Conflicto IdentifierList vs Type resuelto:
+    // Parseamos Identifiers y luego Type. 
+    // Si Type es un Ident, LALRPOP usa lookahead para ver el StringLit (tag).
+    <names:IdentifierList> <t:Type> <tag:StringLit?> => Field { names, typ: t, tag },
+    <t:Type> <tag:StringLit?> => Field { names: vec![], typ: t, tag }, // Embedded
 };
 
-ImportSpecGroup: Vec<ImportSpec> = {
-    <s:ImportSpec> => vec![s],
-    "(" <specs:ImportSpecList> ")" => specs,
+IdentifierList: Vec<String> = {
+    <i:Ident> => vec![i],
+    <mut v:IdentifierList> "," <i:Ident> => { v.push(i); v }
 };
 
-ImportSpecList: Vec<ImportSpec> = {
-    <items:(ImportSpecWithSemi)*> => items.into_iter().flatten().collect(),
+InterfaceType: Type = { "interface" "{" <elems:InterfaceElemList> "}" => Type::Interface(elems) };
+
+InterfaceElemList: Vec<InterfaceElem> = {
+    => vec![],
+    <mut v:InterfaceElemList> <e:InterfaceElem> Semi => { v.push(e); v }
 };
 
-ImportSpecWithSemi: Option<ImportSpec> = {
-    <s:ImportSpec> <Semi?> => Some(s),
-    <Semi> => None,
+InterfaceElem: InterfaceElem = {
+    <id:Ident> <sig:Signature> => InterfaceElem::Method(id, sig),
+    <t:Type> => InterfaceElem::Embed(t),
 };
 
-ImportSpec: ImportSpec = {
-    <name:ImportName?> <path:ImportPath> => ImportSpec { name, path },
+// =============================================================================
+// FUNCTIONS & LITERALS
+// =============================================================================
+
+FunctionLit: Expr = {
+    "func" <sig:Signature> <body:Block> => Expr::FuncLit(sig, body)
 };
 
-ImportName: Ident = {
-    "." => ".".to_string(),
-    <i:Ident> => i,
+Signature: Signature = {
+    <params:Parameters> <res:Result?> => Signature { params, results: res.unwrap_or_default() }
 };
 
-ImportPath: StringLit = {
-    <s:StringLiteral> => StringLit::new(s),
+// SOLUCIÓN AL CONFLICTO DE PARÁMETROS:
+// Parseamos todo como una lista de "ParameterElement" genéricos y luego Rust decide.
+// Un ParameterElement puede ser: "a", "a, b", "int", "a int".
+// Como esto es muy ambiguo en gramática, usamos la estrategia:
+// 1. Parsear lista de (IdentifierList + Type?)
+// Si no hay Type, son tipos anónimos.
+Parameters: Vec<Field> = { 
+    "(" <params:ParameterList> ")" => params
 };
-
-TopLevelDecls: Vec<TopLevelDecl> = {
-    <items:(TopLevelDeclWithSemi)*> => items.into_iter().flatten().collect(),
-};
-
-TopLevelDeclWithSemi: Option<TopLevelDecl> = {
-    <d:TopLevelDecl> <Semi?> => Some(d),
-    <Semi> => None,
-};
-
-TopLevelDecl: TopLevelDecl = {
-    <d:Declaration> => TopLevelDecl::Decl(d),
-    <f:FunctionDecl> => TopLevelDecl::Func(f),
-};
-
-// --------------------------
-// Declarations
-// --------------------------
-
-Declaration: Decl = {
-    <d:ConstDecl> => Decl::Gen(d),
-    <d:TypeDecl> => Decl::Gen(d),
-    <d:VarDecl> => Decl::Gen(d),
-};
-
-ConstDecl: GenDecl = {
-    "const" <specs:ValueSpecGroup> => GenDecl { kind: GenDeclKind::Const, specs: specs.into_iter().map(Spec::Value).collect() },
-};
-
-VarDecl: GenDecl = {
-    "var" <specs:ValueSpecGroup> => GenDecl { kind: GenDeclKind::Var, specs: specs.into_iter().map(Spec::Value).collect() },
-};
-
-TypeDecl: GenDecl = {
-    "type" <specs:TypeSpecGroup> => GenDecl { kind: GenDeclKind::Type, specs: specs.into_iter().map(Spec::Type).collect() },
-};
-
-ValueSpecGroup: Vec<ValueSpec> = {
-    <s:ValueSpec> => vec![s],
-    "(" <list:ValueSpecList> ")" => list,
-};
-
-ValueSpecList: Vec<ValueSpec> = {
-    <items:(ValueSpecWithSemi)*> => items.into_iter().flatten().collect(),
-};
-
-ValueSpecWithSemi: Option<ValueSpec> = {
-    <s:ValueSpec> <Semi?> => Some(s),
-    <Semi> => None,
-};
-
-ValueSpec: ValueSpec = {
-    <names:IdentifierList> <t:Type?> <vals:ValueInit?> => {
-        let (typ, values) = match (t, vals) {
-            (Some(typ), Some(values)) => (Some(typ), values),
-            (Some(typ), None) => (Some(typ), vec![]),
-            (None, Some(values)) => (None, values),
-            (None, None) => (None, vec![]),
-        };
-        ValueSpec { names, typ, values }
-    }
-};
-
-ValueInit: Vec<Expr> = { "=" <es:ExpressionList> => es };
-
-TypeSpecGroup: Vec<TypeSpec> = {
-    <s:TypeSpec> => vec![s],
-    "(" <list:TypeSpecList> ")" => list,
-};
-
-TypeSpecList: Vec<TypeSpec> = {
-    <items:(TypeSpecWithSemi)*> => items.into_iter().flatten().collect(),
-};
-
-TypeSpecWithSemi: Option<TypeSpec> = {
-    <s:TypeSpec> <Semi?> => Some(s),
-    <Semi> => None,
-};
-
-TypeSpec: TypeSpec = {
-    <name:Ident> <tparams:TypeParameters?> <rhs:TypeSpecRhs> => {
-        let (alias, typ) = rhs;
-        TypeSpec { name, type_params: tparams, typ, alias }
-    }
-};
-
-TypeSpecRhs: (bool, Type) = {
-    "=" <t:Type> => (true, t),
-    <t:Type> => (false, t),
-};
-
-// --------------------------
-// Function declarations / signatures
-// --------------------------
-
-FunctionDecl: FuncDecl = {
-    "func" <recv:Receiver?> <name:Ident> <tparams:TypeParameters?> <sig:Signature> <body:Block?> => {
-        FuncDecl { recv, name, type_params: tparams, signature: sig, body }
-    }
-};
-
-Receiver: FieldList = { "(" <f:ReceiverField> ")" => FieldList { fields: vec![f] } };
-
-ReceiverField: Field = {
-    <name:Ident?> <t:Type> => Field { names: name.into_iter().collect(), typ: t },
-};
-
-Signature: Signature = { <params:Parameters> <results:Results?> => Signature { params, results } };
-
-Parameters: FieldList = { "(" <fields:ParameterListOpt> ")" => FieldList { fields } };
-
-ParameterListOpt: Vec<Field> = { <list:ParameterList> => list, => vec![] };
 
 ParameterList: Vec<Field> = {
-    <first:ParameterDecl> <rest:("," <ParameterDecl>)*> ","? => {
-        let mut v = vec![first];
-        v.extend(rest);
-        v
-    }
+    => vec![],
+    <mut v:ParameterListInner> ","? => v,
+};
+
+// ParameterList es la parte más difícil. Usamos una simplificación:
+// Aceptamos `Decl` (names Type) o `Type` (anonymous).
+// Como `Type` puede empezar por `Ident`, hay conflicto.
+// Truco: Permitimos que `Type` consuma el Ident.
+ParameterListInner: Vec<Field> = {
+    <p:ParameterDecl> => vec![p],
+    <mut v:ParameterListInner> "," <p:ParameterDecl> => { v.push(p); v }
 };
 
 ParameterDecl: Field = {
-    <names:IdentifierList?> <dotdot:Variadic?> <t:Type> => {
-        let mut typ = t;
-        if dotdot.is_some() {
-            typ = Type::Slice(Box::new(typ));
-        }
-        Field { names: names.unwrap_or_default(), typ }
-    }
-};
-
-Variadic: () = "..." => ();
-
-Results: Results = { <t:Type> => Results::Type(t), <p:Parameters> => Results::Params(p) };
-
-TypeParameters: TypeParamList = { "[" <params:TypeParamList> "]" => TypeParamList { params } };
-
-TypeParamList: Vec<TypeParam> = {
-    <first:TypeParam> <rest:("," <TypeParam>)*> ","? => {
-        let mut v = vec![first];
-        v.extend(rest);
-        v
-    }
-};
-
-TypeParam: TypeParam = { <names:IdentifierList> <constraint:TypeConstraint> => TypeParam { names, constraint } };
-
-TypeConstraint: Type = { <t:TypeUnion> => t };
-
-TypeUnion: Type = {
-    <first:TypeTerm> <rest:("|" <TypeTerm>)*> => {
-        if rest.is_empty() {
-            first
-        } else {
-            let mut v = vec![first];
-            v.extend(rest);
-            Type::Union(v)
-        }
-    }
-};
-
-TypeTerm: Type = {
-    <t:Type> => t,
-    "~" <t:Type> => Type::Tilde(Box::new(t)),
-};
-
-// --------------------------
-// Types
-// --------------------------
-
-Type: Type = {
-    <t:TypeName> => Type::Named(t),
-    <t:TypeLit> => t,
-    "(" <t:Type> ")" => Type::Paren(Box::new(t)),
-};
-
-TypeName: NamedType = {
-    <q:QualifiedIdent> <args:TypeArguments?> => {
-        let (pkg, name) = q;
-        NamedType { pkg, name, type_args: args }
-    }
-};
-
-QualifiedIdent: (Option<Ident>, Ident) = {
-    <a:Ident> "." <b:Ident> => (Some(a), b),
-    <a:Ident> => (None, a),
-};
-
-TypeArguments: Vec<Type> = { "[" <ts:TypeList> "]" => ts };
-
-TypeLit: Type = {
-    <t:ArrayType> => t,
-    <t:StructType> => t,
-    <t:PointerType> => t,
-    <t:FunctionType> => t,
-    <t:InterfaceType> => t,
-    <t:SliceType> => t,
-    <t:MapType> => t,
-    <t:ChannelType> => t,
-};
-
-ArrayType: Type = { "[" <len:Expression> "]" <elem:Type> => Type::Array { len: Some(Box::new(len)), elem: Box::new(elem) } };
-
-SliceType: Type = { "[" "]" <elem:Type> => Type::Slice(Box::new(elem)) };
-
-StructType: Type = { "struct" "{" <fields:FieldDeclList> "}" => Type::Struct { fields } };
-
-FieldDeclList: Vec<Field> = { <items:(FieldDeclWithSemi)*> => items.into_iter().flatten().collect() };
-
-FieldDeclWithSemi: Option<Field> = { <f:FieldDecl> <Semi?> => Some(f), <Semi> => None };
-
-FieldDecl: Field = {
-    <names:IdentifierList> <t:Type> => Field { names, typ: t },
-    <t:Type> => Field { names: vec![], typ: t },
-};
-
-PointerType: Type = { "*" <t:Type> => Type::Pointer(Box::new(t)) };
-
-FunctionType: Type = { "func" <sig:Signature> => Type::Func { signature: sig } };
-
-InterfaceType: Type = { "interface" "{" <elems:InterfaceElemList> "}" => Type::Interface { methods: elems } };
-
-InterfaceElemList: Vec<InterfaceElem> = { <items:(InterfaceElemWithSemi)*> => items.into_iter().flatten().collect() };
-
-InterfaceElemWithSemi: Option<InterfaceElem> = { <e:InterfaceElem> <Semi?> => Some(e), <Semi> => None };
-
-InterfaceElem: InterfaceElem = {
-    <name:Ident> <tparams:TypeParameters?> <sig:Signature> => InterfaceElem::Method { name, type_params: tparams, sig },
-    <t:TypeUnion> => InterfaceElem::Embed(t),
-};
-
-MapType: Type = { "map" "[" <key:Type> "]" <val:Type> => Type::Map { key: Box::new(key), value: Box::new(val) } };
-
-ChannelType: Type = {
-    "chan" <dir:ChanDir?> <elem:Type> => {
-        let d = dir.unwrap_or(ChanDir::Both);
-        Type::Chan { dir: d, elem: Box::new(elem) }
+    // Intenta parsear "a, b Type".
+    // Si falla (porque no hay coma), intenta "Type".
+    <names:IdentifierList> <dot:"..."?> <t:Type> => {
+        // Aquí hay ambigüedad si IdentifierList tiene un solo elemento 'a' y 'Type' es 'int'.
+        // Go permite 'func(int)' y 'func(a int)'.
+        // LALRPOP shift/reduce preferirá la cadena más larga.
+        let typ = if dot.is_some() { Type::Variadic(Box::new(t)) } else { t };
+        Field { names, typ, tag: None }
     },
-    "<-" "chan" <elem:Type> => Type::Chan { dir: ChanDir::Recv, elem: Box::new(elem) },
-};
-
-ChanDir: ChanDir = { "<-" => ChanDir::Send };
-
-// --------------------------
-// Statements / blocks
-// --------------------------
-
-Block: Block = { "{" <stmts:StmtList> "}" => Block { stmts } };
-
-StmtList: Vec<Stmt> = {
-    <prefix:(StmtWithSemiOrEmpty)*> <last:Stmt?> => {
-        let mut v = prefix;
-        if let Some(last) = last { v.push(last); }
-        v
+    // Caso fallback para tipos anónimos o cuando IdentifierList falló por ser un solo Ident que era Type.
+    // LALRPOP intentará la regla anterior primero.
+    <dot:"..."?> <t:Type> => {
+        let typ = if dot.is_some() { Type::Variadic(Box::new(t)) } else { t };
+        Field::anonymous(typ)
     }
 };
 
-StmtWithSemiOrEmpty: Stmt = {
-    ";" => Stmt::Empty,
-    <s:Stmt> ";" => s,
+Result: Vec<Field> = {
+    <t:Type> => vec![Field::anonymous(t)],
+    "(" <params:ParameterList> ")" => params
 };
 
-Stmt: Stmt = {
-    <d:Declaration> => Stmt::Decl(d),
-    <s:LabeledStmt> => s,
-    <s:SimpleStmt> => s,
-    <s:GoStmt> => s,
-    <s:ReturnStmt> => s,
-    <s:BreakStmt> => s,
-    <s:ContinueStmt> => s,
-    <s:GotoStmt> => s,
-    <s:FallthroughStmt> => s,
-    <b:Block> => Stmt::Block(b),
-    <i:IfStmt> => Stmt::If(i),
-    <f:ForStmt> => Stmt::For(f),
-    <sw:SwitchStmt> => Stmt::Switch(sw),
-    <sel:SelectStmt> => Stmt::Select(sel),
-    <d:DeferStmt> => d,
+LiteralValue: Vec<Element> = { "{" <es:LiteralElementsList> "}" => es };
+
+LiteralElementsList: Vec<Element> = {
+    => vec![],
+    <mut v:LiteralElementsInner> ","? => v,
 };
 
-LabeledStmt: Stmt = { <label:Ident> ":" <s:Stmt> => Stmt::Labeled { label, stmt: Box::new(s) } };
-
-GoStmt: Stmt = { "go" <e:Expression> => Stmt::Go(e) };
-
-DeferStmt: Stmt = { "defer" <e:Expression> => Stmt::Defer(e) };
-
-ReturnStmt: Stmt = { "return" <es:ExpressionListOpt> => Stmt::Return(es) };
-
-BreakStmt: Stmt = { "break" <lab:Ident?> => Stmt::Break(lab) };
-
-ContinueStmt: Stmt = { "continue" <lab:Ident?> => Stmt::Continue(lab) };
-
-GotoStmt: Stmt = { "goto" <lab:Ident> => Stmt::Goto(lab) };
-
-FallthroughStmt: Stmt = { "fallthrough" => Stmt::Fallthrough };
-
-IfStmt: IfStmt = {
-    "if" <init:IfInit?> <cond:Expression> <then:Block> <els:ElsePart?> => IfStmt { init, cond, then_block: then, else_stmt: els },
+LiteralElementsInner: Vec<Element> = {
+    <e:Element> => vec![e],
+    <mut v:LiteralElementsInner> "," <e:Element> => { v.push(e); v }
 };
 
-IfInit: Box<Stmt> = { <s:SimpleStmt> ";" => Box::new(s) };
-
-ElsePart: Box<Stmt> = {
-    "else" <b:Block> => Box::new(Stmt::Block(b)),
-    "else" <i:IfStmt> => Box::new(Stmt::If(i)),
-};
-
-ForStmt: ForStmt = {
-    "for" <kind:ForClauseOrCond?> <b:Block> => {
-        let k = kind.unwrap_or(ForKind::Infinite);
-        ForStmt { kind: k, block: b }
-    }
-};
-
-ForClauseOrCond: ForKind = {
-    <fc:ForClause> => fc,
-    <r:RangeClause> => r,
-    <cond:Expression> => ForKind::Cond(cond),
-};
-
-ForClause: ForKind = {
-    <init:SimpleStmt?> ";" <cond:Expression?> ";" <post:SimpleStmt?> => ForKind::ForClause { init: init.map(Box::new), cond, post: post.map(Box::new) },
-};
-
-RangeClause: ForKind = {
-    <lhs:RangeLhsOpt> <define:RangeAssignOp> "range" <e:Expression> => ForKind::Range { lhs, expr: e, define },
-    "range" <e:Expression> => ForKind::Range { lhs: None, expr: e, define: false },
-};
-
-RangeLhsOpt: Option<RangeLhs> = { <lhs:ExpressionList> => Some(RangeLhs { exprs: lhs }) };
-
-RangeAssignOp: bool = { ":=" => true, "=" => false };
-
-SwitchStmt: SwitchStmt = {
-    "switch" <init:IfInit?> <tag:Expression?> "{" <clauses:SwitchClauseList> "}" => SwitchStmt { init, tag, clauses },
-    "switch" <init:IfInit?> <guard:TypeSwitchGuard> "{" <clauses:TypeSwitchClauseList> "}" => {
-        let _ = guard;
-        SwitchStmt { init, tag: None, clauses }
-    },
-};
-
-SwitchClauseList: Vec<SwitchClause> = { <items:(ExprCaseClause)*> => items };
-
-ExprCaseClause: SwitchClause = {
-    "case" <es:ExpressionList> ":" <ss:StmtList> => SwitchClause::Expr { exprs: es, stmts: ss },
-    "default" ":" <ss:StmtList> => SwitchClause::Default { stmts: ss },
-};
-
-TypeSwitchGuard: (Option<Ident>, Expr) = {
-    <s:SimpleStmt> => {
-        (None, match s {
-            Stmt::Expr(e) => e,
-            Stmt::Assign{rhs, ..} => rhs.into_iter().next().unwrap_or(Expr::Ident("_".to_string())),
-            _ => Expr::Ident("_".to_string())
-        })
-    }
-};
-
-TypeSwitchClauseList: Vec<SwitchClause> = { <items:(TypeCaseClause)*> => items };
-
-TypeCaseClause: SwitchClause = {
-    "case" <ts:TypeList> ":" <ss:StmtList> => SwitchClause::Type { types: ts, bind: None, stmts: ss },
-    "default" ":" <ss:StmtList> => SwitchClause::Default { stmts: ss },
-};
-
-SelectStmt: SelectStmt = { "select" "{" <clauses:CommClauseList> "}" => SelectStmt { clauses } };
-
-CommClauseList: Vec<CommClause> = { <items:(CommClause)*> => items };
-
-CommClause: CommClause = {
-    "case" <c:CommStmt> ":" <ss:StmtList> => CommClause::Comm { comm: c, stmts: ss },
-    "default" ":" <ss:StmtList> => CommClause::Default { stmts: ss },
-};
-
-CommStmt: CommStmt = {
-    <send:SendStmt> => match send { Stmt::Send{chan, value} => CommStmt::Send{chan, value}, _ => CommStmt::Send{chan: Expr::Ident("_".to_string()), value: Expr::Ident("_".to_string())}},
-    <recv:RecvStmt> => recv,
-};
-
-RecvStmt: CommStmt = {
-    <e:Expression> => CommStmt::Recv { lhs: None, define: false, recv: e },
-    <lhs:ExpressionList> <def:RangeAssignOp> <e:Expression> => CommStmt::Recv { lhs: Some(lhs), define: def, recv: e },
-};
-
-// --------------------------
-// Simple statements
-// --------------------------
-
-SimpleStmt: Stmt = {
-    <s:SendStmt> => s,
-    <s:IncDecStmt> => s,
-    <s:Assignment> => s,
-    <s:ShortVarDecl> => s,
-    <e:Expression> => Stmt::Expr(e),
-};
-
-SendStmt: Stmt = { <ch:Expression> "<-" <v:Expression> => Stmt::Send { chan: ch, value: v } };
-
-IncDecStmt: Stmt = {
-    <e:Expression> "++" => Stmt::IncDec { expr: e, op: IncDecOp::Inc },
-    <e:Expression> "--" => Stmt::IncDec { expr: e, op: IncDecOp::Dec },
-};
-
-Assignment: Stmt = { <lhs:ExpressionList> <op:AssignOp> <rhs:ExpressionList> => Stmt::Assign { lhs, op, rhs } };
-
-AssignOp: AssignOp = {
-    "=" => AssignOp::Assign,
-    ":=" => AssignOp::Define,
-    "+=" => AssignOp::AddAssign,
-    "-=" => AssignOp::SubAssign,
-    "*=" => AssignOp::MulAssign,
-    "/=" => AssignOp::DivAssign,
-    "%=" => AssignOp::ModAssign,
-    "&=" => AssignOp::AndAssign,
-    "|=" => AssignOp::OrAssign,
-    "^=" => AssignOp::XorAssign,
-    "<<=" => AssignOp::ShlAssign,
-    ">>=" => AssignOp::ShrAssign,
-    "&^=" => AssignOp::AndNotAssign,
-};
-
-ShortVarDecl: Stmt = { <names:IdentifierList> ":=" <vals:ExpressionList> => Stmt::ShortVarDecl { names, values: vals } };
-
-// --------------------------
-// Expressions
-// --------------------------
-
-Expression: Expr = <e:LogicalOrExpr> => e;
-
-LogicalOrExpr: Expr = {
-    <l:LogicalAndExpr> <rest:("||" <LogicalAndExpr>)*> => {
-        rest.into_iter().fold(l, |acc, rhs| Expr::Binary{ left: Box::new(acc), op: BinaryOp::LOr, right: Box::new(rhs) })
-    }
-};
-
-LogicalAndExpr: Expr = {
-    <l:RelExpr> <rest:("&&" <RelExpr>)*> => {
-        rest.into_iter().fold(l, |acc, rhs| Expr::Binary{ left: Box::new(acc), op: BinaryOp::LAnd, right: Box::new(rhs) })
-    }
-};
-
-RelExpr: Expr = {
-    <l:AddExpr> <rest:(RelOp <AddExpr>)*> => {
-        rest.into_iter().fold(l, |acc, (op, rhs)| Expr::Binary{ left: Box::new(acc), op, right: Box::new(rhs) })
-    }
-};
-
-RelOp: BinaryOp = {
-    "==" => BinaryOp::Eq,
-    "!=" => BinaryOp::Ne,
-    "<" => BinaryOp::Lt,
-    "<=" => BinaryOp::Le,
-    ">" => BinaryOp::Gt,
-    ">=" => BinaryOp::Ge,
-};
-
-AddExpr: Expr = {
-    <l:MulExpr> <rest:(AddOp <MulExpr>)*> => {
-        rest.into_iter().fold(l, |acc, (op, rhs)| Expr::Binary{ left: Box::new(acc), op, right: Box::new(rhs) })
-    }
-};
-
-AddOp: BinaryOp = {
-    "+" => BinaryOp::Add,
-    "-" => BinaryOp::Sub,
-    "|" => BinaryOp::Or,
-    "^" => BinaryOp::Xor,
-};
-
-MulExpr: Expr = {
-    <l:UnaryExpr> <rest:(MulOp <UnaryExpr>)*> => {
-        rest.into_iter().fold(l, |acc, (op, rhs)| Expr::Binary{ left: Box::new(acc), op, right: Box::new(rhs) })
-    }
-};
-
-MulOp: BinaryOp = {
-    "*" => BinaryOp::Mul,
-    "/" => BinaryOp::Div,
-    "%" => BinaryOp::Mod,
-    "<<" => BinaryOp::Shl,
-    ">>" => BinaryOp::Shr,
-    "&" => BinaryOp::And,
-    "&^" => BinaryOp::AndNot,
-};
-
-UnaryExpr: Expr = {
-    <p:PrimaryExpr> => p,
-    <op:UnaryOp> <e:UnaryExpr> => Expr::Unary { op, expr: Box::new(e) },
-    "*" <e:UnaryExpr> => Expr::Star(Box::new(e)),
-    "<-" <e:UnaryExpr> => Expr::Receive(Box::new(e)),
-    "&" <e:UnaryExpr> => Expr::Unary { op: UnaryOp::Addr, expr: Box::new(e) },
-};
-
-UnaryOp: UnaryOp = { "+" => UnaryOp::Add, "-" => UnaryOp::Sub, "!" => UnaryOp::Not, "^" => UnaryOp::Xor };
-
-PrimaryExpr: Expr = { <op:Operand> <sufs:Suffix*> => sufs.into_iter().fold(op, |acc, s| s.apply(acc)) };
-
-Suffix: Suffix = {
-    "." <id:Ident> => Suffix::Selector(id),
-    "[" <sl:SliceOrIndex> "]" => sl,
-    "." "(" <t:Type> ")" => Suffix::TypeAssert(t),
-    "(" <args:ArgumentsOpt> ")" => args,
-};
-
-SliceOrIndex: Suffix = {
-    <lo:Expression?> ":" <hi:Expression?> <max:(":" <Expression>)?> => {
-        let max_expr = max.map(|(_, e)| Box::new(e));
-        Suffix::Slice { lo: lo.map(Box::new), hi: hi.map(Box::new), max: max_expr }
-    },
-    <es:ExpressionList> => Suffix::IndexOrArgs(es),
-    => Suffix::IndexOrArgs(vec![]),
-};
-
-ArgumentsOpt: Suffix = {
-    <args:ArgumentListOpt> <dots:VariadicArgs?> ","? => {
-        let variadic = dots.is_some();
-        Suffix::Call { args, variadic }
-    },
-    => Suffix::Call { args: vec![], variadic: false },
-};
-
-ArgumentListOpt: Vec<Expr> = { ExpressionList, => vec![] };
-
-VariadicArgs: () = { "..." => () };
-
-Operand: Expr = {
-    <n:Ident> => Expr::Ident(n),
-    <l:BasicLit> => Expr::BasicLit(l),
-    <c:CompositeLit> => c,
-    <f:FunctionLit> => f,
-    "(" <e:Expression> ")" => Expr::Paren(Box::new(e)),
+Element: Element = {
+    // Usamos Expression para key y value. Precedencia ":" es muy baja.
+    <k:Expr2> ":" <v:Expression> => Element::KeyValue(k, v), // Expr2 evita conflicto con literal struct anidado
+    <v:Expression> => Element::Val(v)
 };
 
 BasicLit: BasicLit = {
@@ -727,52 +315,55 @@ BasicLit: BasicLit = {
     <s:"FLOAT"> => BasicLit { kind: BasicLitKind::Float, raw: s },
     <s:"IMAG"> => BasicLit { kind: BasicLitKind::Imag, raw: s },
     <s:"RUNE"> => BasicLit { kind: BasicLitKind::Rune, raw: s },
-    <s:StringLiteral> => BasicLit { kind: BasicLitKind::String, raw: s },
+    <s:StringLit> => BasicLit { kind: BasicLitKind::String, raw: s },
 };
 
-StringLiteral: String = { <s:"STRING"> => s, <s:"RAW_STRING"> => s };
+Block: Block = { "{" "}" => Block(vec![]) }; 
 
-FunctionLit: Expr = {
-    "func" <_tparams:TypeParameters?> <sig:Signature> <body:Block> => Expr::FuncLit { signature: sig, body },
-};
+// =============================================================================
+// LEXER
+// =============================================================================
 
-CompositeLit: Expr = { <t:LiteralType> <v:LiteralValue> => Expr::CompositeLit { typ: t, elements: v } };
+extern {
+    type Location = usize;
+    type Error = &'static str;
 
-LiteralType: Type = { <t:Type> => t };
+    enum Tok {
+        "IDENT" => Tok::Ident(<String>),
+        "STRING" => Tok::StringLit(<String>),
+        "RAW_STRING" => Tok::RawStringLit(<String>),
+        "INT" => Tok::IntLit(<String>),
+        "FLOAT" => Tok::FloatLit(<String>),
+        "IMAG" => Tok::ImagLit(<String>),
+        "RUNE" => Tok::RuneLit(<String>),
 
-LiteralValue: Vec<Element> = { "{" <es:ElementListOpt> "}" => es };
+        "func" => Tok::KwFunc, "interface" => Tok::KwInterface, "select" => Tok::KwSelect,
+        "case" => Tok::KwCase, "defer" => Tok::KwDefer, "go" => Tok::KwGo,
+        "map" => Tok::KwMap, "struct" => Tok::KwStruct, "chan" => Tok::KwChan,
+        "else" => Tok::KwElse, "goto" => Tok::KwGoto, "package" => Tok::KwPackage,
+        "switch" => Tok::KwSwitch, "const" => Tok::KwConst, "fallthrough" => Tok::KwFallthrough,
+        "if" => Tok::KwIf, "range" => Tok::KwRange, "type" => Tok::KwType,
+        "continue" => Tok::KwContinue, "for" => Tok::KwFor, "import" => Tok::KwImport,
+        "return" => Tok::KwReturn, "var" => Tok::KwVar, "break" => Tok::KwBreak,
+        "default" => Tok::KwDefault,
 
-ElementListOpt: Vec<Element> = {
-    <first:Element> <rest:("," <Element>)*> ","? => {
-        let mut v = vec![first];
-        v.extend(rest);
-        v
-    },
-    => vec![],
-};
-
-Element: Element = { <k:Expression> ":" <v:Expression> => Element::KeyValue { key: k, value: v }, <v:Expression> => Element::Expr(v) };
-
-// --------------------------
-// Internal helper type for suffix folding.
-// --------------------------
-
-enum Suffix {
-    Selector(Ident),
-    IndexOrArgs(Vec<Expr>),
-    Slice { lo: Option<Box<Expr>>, hi: Option<Box<Expr>>, max: Option<Box<Expr>> },
-    TypeAssert(Type),
-    Call { args: Vec<Expr>, variadic: bool },
-}
-
-impl Suffix {
-    fn apply(self, base: Expr) -> Expr {
-        match self {
-            Suffix::Selector(sel) => Expr::Selector { expr: Box::new(base), sel },
-            Suffix::IndexOrArgs(args) => Expr::IndexOrTypeArgs { expr: Box::new(base), args },
-            Suffix::Slice { lo, hi, max } => Expr::Slice { expr: Box::new(base), lo, hi, max },
-            Suffix::TypeAssert(typ) => Expr::TypeAssert { expr: Box::new(base), typ },
-            Suffix::Call { args, variadic } => Expr::Call { fun: Box::new(base), args, variadic },
-        }
+        "+" => Tok::Plus, "-" => Tok::Minus, "*" => Tok::Star, "/" => Tok::Slash,
+        "%" => Tok::Percent, "&" => Tok::Amp, "|" => Tok::Pipe, "^" => Tok::Caret,
+        "<<" => Tok::Shl, ">>" => Tok::Shr, "&^" => Tok::AndNot,
+        "+=" => Tok::AddAssign, "-=" => Tok::SubAssign, "*=" => Tok::MulAssign,
+        "/=" => Tok::DivAssign, "%=" => Tok::ModAssign, "&=" => Tok::AndAssign,
+        "|=" => Tok::OrAssign, "^=" => Tok::XorAssign, "<<=" => Tok::ShlAssign,
+        ">>=" => Tok::ShrAssign, "&^=" => Tok::AndNotAssign,
+        "&&" => Tok::LAnd, "||" => Tok::LOr, "<-" => Tok::Arrow, "++" => Tok::Inc,
+        "--" => Tok::Dec, "==" => Tok::EqEq, "<" => Tok::Lt, ">" => Tok::Gt,
+        "=" => Tok::Assign, "!" => Tok::Bang, "!=" => Tok::NotEq, "<=" => Tok::Le,
+        ">=" => Tok::Ge, ":=" => Tok::Define, "..." => Tok::Ellipsis,
+        
+        "(" => Tok::LParen, ")" => Tok::RParen, "[" => Tok::LBrack, "]" => Tok::RBrack,
+        "{" => Tok::LBrace, "}" => Tok::RBrace, "," => Tok::Comma, "." => Tok::Dot,
+        ";" => Tok::Semi, ":" => Tok::Colon, "~" => Tok::Tilde,
     }
 }
+
+StringLit: String = { "STRING" => <>, "RAW_STRING" => <> };
+ChanDir: ChanDir = { "<-" => ChanDir::Send };

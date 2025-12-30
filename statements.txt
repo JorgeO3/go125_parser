@@ -1,0 +1,138 @@
+pub SourceFile: SourceFile = {
+    "package" <pkg:Ident> Semi <imports:ImportDecl*> <decls:TopLevelDecl*> => 
+        SourceFile { pkg, imports: imports.concat(), decls }
+};
+
+ImportDecl: Vec<ImportSpec> = {
+    "import" <s:ImportSpec> Semi => vec![s],
+    "import" "(" <s:(ImportSpec Semi)*> ")" Semi => s.into_iter().map(|(x,_)| x).collect(),
+};
+
+ImportSpec: ImportSpec = {
+    <name:Ident?> <path:StringLit> => ImportSpec { name, path }
+};
+
+TopLevelDecl: TopLevelDecl = {
+    <d:Declaration> Semi => TopLevelDecl::Decl(d),
+    <f:FunctionDecl> Semi => TopLevelDecl::Func(f),
+};
+
+Declaration: Decl = {
+    "const" <specs:SpecBlock<ConstSpec>> => Decl::Const(specs),
+    "var" <specs:SpecBlock<VarSpec>> => Decl::Var(specs),
+    "type" <specs:SpecBlock<TypeSpec>> => Decl::Type(specs),
+};
+
+SpecBlock<T>: Vec<T> = {
+    <s:T> => vec![s],
+    "(" <s:(T Semi)*> ")" => s.into_iter().map(|(x,_)| x).collect(),
+};
+
+VarSpec: VarSpec = {
+    <names:IdentifierList> <t:Type?> <v:("=" <ExpressionList>)?> => 
+        VarSpec { names, typ: t, values: v.unwrap_or_default() }
+};
+
+ConstSpec: ConstSpec = {
+    <names:IdentifierList> <t:Type?> <v:("=" <ExpressionList>)?> => 
+        ConstSpec { names, typ: t, values: v.unwrap_or_default() }
+};
+
+TypeSpec: TypeSpec = {
+    <name:Ident> <tparams:TypeParams?> <assign:"="?> <t:Type> => 
+        TypeSpec { name, tparams, alias: assign.is_some(), typ: t }
+};
+
+TypeParams: Vec<TypeParam> = {
+    "[" <p:CommaTrail<TypeParam>> "]" => p
+};
+
+TypeParam: TypeParam = {
+    <names:IdentifierList> <constraint:Type> => TypeParam { names, constraint }
+};
+
+FunctionDecl: FuncDecl = {
+    "func" <recv:Receiver?> <name:Ident> <tparams:TypeParams?> <sig:Signature> <body:Block?> => 
+        FuncDecl { recv, name, tparams, sig, body }
+};
+
+Receiver: Field = { "(" <f:ParameterDecl> ")" => f };
+
+Block: Block = { "{" <stmts:StatementList> "}" => Block(stmts) };
+
+// SOLUCIÓN 3: Factorización de Statements para eliminar conflictos
+Statement: Stmt = {
+    <d:Declaration> => Stmt::Decl(d),
+    <s:SimpleStmt> => s, // Aquí está la magia
+    "return" <e:ExpressionList?> => Stmt::Return(e.unwrap_or_default()),
+    "break" <label:Ident?> => Stmt::Break(label),
+    "continue" <label:Ident?> => Stmt::Continue(label),
+    "goto" <label:Ident> => Stmt::Goto(label),
+    "fallthrough" => Stmt::Fallthrough,
+    "defer" <e:Expression> => Stmt::Defer(e),
+    "go" <e:Expression> => Stmt::Go(e),
+    <b:Block> => Stmt::Block(b),
+    <i:IfStmt> => i,
+    <s:SwitchStmt> => s,
+    <s:SelectStmt> => s,
+    <f:ForStmt> => f,
+};
+
+// Factorización del conflicto Asignación vs Expresión vs ShortVarDecl
+SimpleStmt: Stmt = {
+    // 1. Asignaciones y Short Vars empiezan con una lista de expresiones (izquierda)
+    <lhs:ExpressionList> <op:AssignOp> <rhs:ExpressionList> => Stmt::Assign(lhs, op, rhs),
+    
+    // 2. Short Var Declaration (: =)
+    // Nota: lhs debe ser sintácticamente ExpressionList, validado semánticamente a Idents
+    <lhs:ExpressionList> ":=" <rhs:ExpressionList> => Stmt::Define(lhs, rhs),
+    
+    // 3. Incremento/Decremento
+    <lhs:Expression> "++" => Stmt::Inc(lhs),
+    <lhs:Expression> "--" => Stmt::Dec(lhs),
+    
+    // 4. Expression Statement pura
+    <expr:Expression> => Stmt::Expr(expr),
+};
+
+IfStmt: Stmt = {
+    "if" <init:(SimpleStmt ";")?> <cond:Expression> <body:Block> <els:("else" <Statement>)?> => 
+        Stmt::If(init.map(Box::new), cond, body, els.map(Box::new))
+};
+
+ForStmt: Stmt = {
+    "for" <init:SimpleStmt?> ";" <cond:Expression?> ";" <post:SimpleStmt?> <body:Block> => 
+        Stmt::For(ForHeader::Clause(init.map(Box::new), cond, post.map(Box::new)), body),
+    "for" <cond:Expression> <body:Block> => 
+        Stmt::For(ForHeader::Condition(cond), body),
+    "for" <body:Block> => 
+        Stmt::For(ForHeader::Infinite, body),
+    // Usamos RangeOp helper para evitar el conflicto inline
+    "for" <lhs:ExpressionList> <def:RangeOp> "range" <x:Expression> <body:Block> => 
+        Stmt::For(ForHeader::Range(lhs, def, x), body),
+};
+
+RangeOp: bool = { ":=" => true, "=" => false };
+
+SwitchStmt: Stmt = {
+    "switch" <init:(SimpleStmt ";")?> <tag:Expression?> "{" <clauses:CaseClause*> "}" =>
+        Stmt::Switch(init.map(Box::new), tag, clauses)
+};
+
+CaseClause: CaseClause = {
+    "case" <exprs:ExpressionList> ":" <stmts:StatementList> => CaseClause::Case(exprs, stmts),
+    "default" ":" <stmts:StatementList> => CaseClause::Default(stmts),
+};
+
+SelectStmt: Stmt = {
+    "select" "{" <clauses:CommClause*> "}" => Stmt::Select(clauses)
+};
+
+CommClause: CommClause = {
+    "case" <comm:SimpleStmt> ":" <stmts:StatementList> => CommClause::Case(comm, stmts),
+    "default" ":" <stmts:StatementList> => CommClause::Default(stmts),
+};
+
+StatementList: Vec<Stmt> = {
+    <s:(Statement Semi)*> => s.into_iter().map(|(x,_)| x).collect()
+};

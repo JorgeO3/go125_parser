@@ -114,12 +114,28 @@ pub struct Block {
 pub enum Stmt {
     Decl(Decl),
     Empty,
-    Labeled { label: Ident, stmt: Box<Stmt> },
+    Labeled {
+        label: Ident,
+        stmt: Box<Stmt>,
+    },
     Expr(Expr),
-    Send { chan: Expr, value: Expr },
-    IncDec { expr: Expr, op: IncDecOp },
-    Assign { lhs: Vec<Expr>, op: AssignOp, rhs: Vec<Expr> },
-    ShortVarDecl { names: Vec<Ident>, values: Vec<Expr> },
+    Send {
+        chan: Expr,
+        value: Expr,
+    },
+    IncDec {
+        expr: Expr,
+        op: IncDecOp,
+    },
+    Assign {
+        lhs: Vec<Expr>,
+        op: AssignOp,
+        rhs: Vec<Expr>,
+    },
+    ShortVarDecl {
+        names: Vec<Ident>,
+        values: Vec<Expr>,
+    },
     Go(Expr),
     Defer(Expr),
     Return(Vec<Expr>),
@@ -132,6 +148,16 @@ pub enum Stmt {
     For(ForStmt),
     Switch(SwitchStmt),
     Select(SelectStmt),
+}
+
+// Este enum es necesario para la regla SimpleStmt del parser
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtSuffix {
+    Assign(AssignOp, Vec<Expr>),
+    Define(Vec<Expr>),
+    Send(Expr),
+    Inc,
+    Dec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,8 +201,16 @@ pub struct ForStmt {
 pub enum ForKind {
     Infinite,
     Cond(Expr),
-    ForClause { init: Option<Box<Stmt>>, cond: Option<Expr>, post: Option<Box<Stmt>> },
-    Range { lhs: Option<RangeLhs>, expr: Expr, define: bool },
+    ForClause {
+        init: Option<Box<Stmt>>,
+        cond: Option<Expr>,
+        post: Option<Box<Stmt>>,
+    },
+    Range {
+        lhs: Option<RangeLhs>,
+        expr: Expr,
+        define: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,9 +227,18 @@ pub struct SwitchStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SwitchClause {
-    Expr { exprs: Vec<Expr>, stmts: Vec<Stmt> },
-    Default { stmts: Vec<Stmt> },
-    Type { types: Vec<Type>, bind: Option<Ident>, stmts: Vec<Stmt> },
+    Expr {
+        exprs: Vec<Expr>,
+        stmts: Vec<Stmt>,
+    },
+    Default {
+        stmts: Vec<Stmt>,
+    },
+    Type {
+        types: Vec<Type>,
+        bind: Option<Ident>,
+        stmts: Vec<Stmt>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -211,26 +254,81 @@ pub enum CommClause {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommStmt {
-    Send { chan: Expr, value: Expr },
-    Recv { lhs: Option<Vec<Expr>>, define: bool, recv: Expr },
+    Send {
+        chan: Expr,
+        value: Expr,
+    },
+    Recv {
+        lhs: Option<Vec<Expr>>,
+        define: bool,
+        recv: Expr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Ident(Ident),
     BasicLit(BasicLit),
-    CompositeLit { typ: Type, elements: Vec<Element> },
-    FuncLit { signature: Signature, body: Block },
+    CompositeLit {
+        typ: Type,
+        elements: Vec<Element>,
+    },
+    FuncLit {
+        signature: Signature,
+        body: Block,
+    },
     Paren(Box<Expr>),
-    Selector { expr: Box<Expr>, sel: Ident },
-    IndexOrTypeArgs { expr: Box<Expr>, args: Vec<Expr> },
-    Slice { expr: Box<Expr>, lo: Option<Box<Expr>>, hi: Option<Box<Expr>>, max: Option<Box<Expr>> },
-    TypeAssert { expr: Box<Expr>, typ: Type },
-    Call { fun: Box<Expr>, args: Vec<Expr>, variadic: bool },
-    Unary { op: UnaryOp, expr: Box<Expr> },
-    Binary { left: Box<Expr>, op: BinaryOp, right: Box<Expr> },
+    Selector {
+        expr: Box<Expr>,
+        ident: Ident, // Renombrado de 'sel' a 'ident' para coincidir con la gramática
+    },
+    Index {
+        expr: Box<Expr>,
+        index: Box<Expr>,
+    },
+    Slice {
+        expr: Box<Expr>,
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
+        max: Option<Box<Expr>>,
+    },
+    TypeAssert {
+        expr: Box<Expr>,
+        typ: Type,
+    },
+    Call {
+        fun: Box<Expr>, // En la gramática usamos `func`, pero `fun` evita keyword de Rust
+        args: Vec<Expr>,
+        variadic: bool,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        left: Box<Expr>,
+        op: BinaryOp,
+        right: Box<Expr>,
+    },
     Star(Box<Expr>),
+    Starred {
+        // Usado para "..." en argumentos o arrays
+        value: Box<Expr>,
+        ctx: ExprContext,
+    },
     Receive(Box<Expr>),
+
+    // Representa un tipo envuelto como expresión (usado en literales compuestos anónimos)
+    TypeWrapper(Type),
+
+    // Para recuperación de errores
+    Bad,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExprContext {
+    Load,
+    Store,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,18 +389,35 @@ pub enum BinaryOp {
 pub enum Type {
     Named(NamedType),
     Pointer(Box<Type>),
-    Array { len: Option<Box<Expr>>, elem: Box<Type> },
+    Array {
+        len: Option<Box<Expr>>,
+        elem: Box<Type>,
+    },
     Slice(Box<Type>),
-    Map { key: Box<Type>, value: Box<Type> },
-    Chan { dir: ChanDir, elem: Box<Type> },
-    Struct { fields: Vec<Field> },
-    Interface { methods: Vec<InterfaceElem> },
-    Func { signature: Signature },
-    /// Type union / type set (used in constraints): `T1 | ~T2 | ...`.
+    Map {
+        key: Box<Type>,
+        value: Box<Type>,
+    },
+    Chan {
+        dir: ChanDir,
+        elem: Box<Type>,
+    },
+    Struct {
+        fields: Vec<Field>,
+    },
+    Interface {
+        methods: Vec<InterfaceElem>,
+    },
+    Func {
+        signature: Signature,
+    },
     Union(Vec<Type>),
-    /// Approximation type term: `~T` (constraints).
     Tilde(Box<Type>),
     Paren(Box<Type>),
+
+    // CRUCIAL: Permite que el parser guarde una expresión temporalmente
+    // cuando está parseando `MiStruct{...}` antes de saber si es un tipo.
+    ExprFallback(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -321,7 +436,11 @@ pub enum ChanDir {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterfaceElem {
-    Method { name: Ident, type_params: Option<TypeParamList>, sig: Signature },
+    Method {
+        name: Ident,
+        type_params: Option<TypeParamList>,
+        sig: Signature,
+    },
     Embed(Type),
 }
 
