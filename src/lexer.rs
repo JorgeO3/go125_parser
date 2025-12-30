@@ -1,356 +1,485 @@
-use std::collections::VecDeque;
-
+use crate::error::{Diag, LexError, LexErrorKind};
 use logos::{Lexer as LogosLexer, Logos};
-use unicode_ident::{is_xid_continue, is_xid_start};
 
-use crate::error::{Diag, DiagKind, LexError, LexErrorKind};
+// =============================================================================
+// 1. Token Definition (RawTok - DFA optimizado para logos)
+// =============================================================================
 
-#[derive(Logos, Debug, Clone, PartialEq)]
+/// Token interno optimizado para el DFA de logos
+#[derive(Logos, Debug, Clone, Copy, PartialEq, Eq)]
 #[logos(error = LexErrorKind)]
+#[logos(skip r"[\t\x0C\f\v ]+")]
+#[rustfmt::skip]
 enum RawTok {
-    // --- Trivia ---
-    #[regex(r"[\t\x0C\f\v ]+", logos::skip)]
-    _Ws,
+    // Trivia
+    #[regex(r"\r\n|\n|\r")] Newline,
+    #[regex(r"//[^\n\r]*", logos::skip, allow_greedy = true)] _LineComment,
+    #[regex(r"/\*([^*]|\*[^/])*\*/")] BlockComment,
 
-    // Keep newlines as tokens to implement semicolon insertion.
-    #[regex(r"\r\n|\n|\r")]
-    Newline,
+    // Keywords
+    #[token("break")] KwBreak,
+    #[token("case")] KwCase,
+    #[token("chan")] KwChan,
+    #[token("const")] KwConst,
+    #[token("continue")] KwContinue,
+    #[token("default")] KwDefault,
+    #[token("defer")] KwDefer,
+    #[token("else")] KwElse,
+    #[token("fallthrough")] KwFallthrough,
+    #[token("for")] KwFor,
+    #[token("func")] KwFunc,
+    #[token("go")] KwGo,
+    #[token("goto")] KwGoto,
+    #[token("if")] KwIf,
+    #[token("import")] KwImport,
+    #[token("interface")] KwInterface,
+    #[token("map")] KwMap,
+    #[token("package")] KwPackage,
+    #[token("range")] KwRange,
+    #[token("return")] KwReturn,
+    #[token("select")] KwSelect,
+    #[token("struct")] KwStruct,
+    #[token("switch")] KwSwitch,
+    #[token("type")] KwType,
+    #[token("var")] KwVar,
 
-    // Line comment (newline excluded).
-    #[regex(r"//[^\n\r]*", logos::skip)]
-    _LineComment,
+    // Literals
+    #[regex(r"[_\p{XID_Start}][_\p{XID_Continue}]*")] Ident,
+    #[regex(r"`[^`]*`")] RawString,
+    #[regex(r#""([^"\\\n\r]|\\.)*""#, validate_interpreted_string)] String,
+    #[regex(r"'([^'\\\n\r]|\\.)+'", validate_rune_lit)] Rune,
+    #[regex(r"0[xX][0-9a-fA-F_]+", validate_number)] IntHex,
+    #[regex(r"0[oO][0-7_]+", validate_number)] IntOct,
+    #[regex(r"0[bB][01_]+", validate_number)] IntBin,
+    #[regex(r"[0-9_]*\.[0-9_]+([eE][+-]?[0-9_]+)?|[0-9_]+[eE][+-]?[0-9_]+", validate_number)] Float,
+    #[regex(r"[0-9][0-9_]*", validate_number)] IntDec,
+    #[regex(r"(0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9_]+|[0-9_]*\.[0-9_]+([eE][+-]?[0-9_]+)?|[0-9_]+[eE][+-]?[0-9_]+)i", validate_imag)] Imag,
 
-    // Block comment: we do NOT skip; we need to detect if it contains newlines.
-    #[regex(r"(?s)/\*.*?\*/")]
-    BlockComment,
+    // Operators (multi-char first)
+    #[token("...")] Ellipsis,
+    #[token("<<=")] ShlAssign,
+    #[token(">>=")] ShrAssign,
+    #[token("&^=")] AndNotAssign,
+    #[token("+=")] AddAssign,
+    #[token("-=")] SubAssign,
+    #[token("*=")] MulAssign,
+    #[token("/=")] DivAssign,
+    #[token("%=")] ModAssign,
+    #[token("&=")] AndAssign,
+    #[token("|=")] OrAssign,
+    #[token("^=")] XorAssign,
+    #[token("<<")] Shl,
+    #[token(">>")] Shr,
+    #[token("&^")] AndNot,
+    #[token("&&")] LAnd,
+    #[token("||")] LOr,
+    #[token("==")] EqEq,
+    #[token("!=")] NotEq,
+    #[token("<=")] Le,
+    #[token(">=")] Ge,
+    #[token("++")] Inc,
+    #[token("--")] Dec,
+    #[token(":=")] Define,
+    #[token("<-")] Arrow,
+    #[token("=")] Assign,
+    #[token("+")] Plus,
+    #[token("-")] Minus,
+    #[token("*")] Star,
+    #[token("/")] Slash,
+    #[token("%")] Percent,
+    #[token("&")] Amp,
+    #[token("|")] Pipe,
+    #[token("^")] Caret,
+    #[token("~")] Tilde,
+    #[token("!")] Bang,
+    #[token("<")] Lt,
+    #[token(">")] Gt,
 
-    // --- Ident & keywords (keywords are mapped in adapter) ---
-    #[regex(r"[_\p{XID_Start}][_\p{XID_Continue}]*")]
-    Ident,
+    // Delimiters
+    #[token("(")] LParen,
+    #[token(")")] RParen,
+    #[token("[")] LBrack,
+    #[token("]")] RBrack,
+    #[token("{")] LBrace,
+    #[token("}")] RBrace,
+    #[token(",")] Comma,
+    #[token(";")] Semi,
+    #[token(":")] Colon,
+    #[token(".")] Dot,
 
-    // --- Literals ---
-    // Raw string literal (backquoted). Can contain newlines.
-    #[regex(r"`[^`]*`")]
-    RawString,
-
-    // Interpreted string literal.
-    #[regex(r"\"([^\"\\\n\r]|\\.)*\"", validate_interpreted_string)]
-    String,
-
-    // Rune literal.
-    #[regex(r"'([^'\\\n\r]|\\.)+'", validate_rune_lit)]
-    Rune,
-
-    // Numeric literals (approximate). We validate underscores lightly.
-    #[regex(r"0[bB][01]([01_]*[01])?", validate_number)]
-    Int,
-    #[regex(r"0[oO][0-7]([0-7_]*[0-7])?", validate_number)]
-    Int,
-    #[regex(r"0[xX][0-9a-fA-F]([0-9a-fA-F_]*[0-9a-fA-F])?", validate_number)]
-    Int,
-    #[regex(r"0([0-7_]*[0-7])?", validate_number)]
-    Int,
-    #[regex(r"[1-9]([0-9_]*[0-9])?", validate_number)]
-    Int,
-
-    // Floats: decimal with dot and/or exponent.
-    #[regex(r"([0-9]([0-9_]*[0-9])?\.[0-9]([0-9_]*[0-9])?([eE][+-]?[0-9]([0-9_]*[0-9])?)?)|([0-9]([0-9_]*[0-9])?[eE][+-]?[0-9]([0-9_]*[0-9])?)|(\.[0-9]([0-9_]*[0-9])?([eE][+-]?[0-9]([0-9_]*[0-9])?)?)", validate_number)]
-    Float,
-
-    // Imaginary: int or float followed by i.
-    #[regex(r"((0[xX][0-9a-fA-F]([0-9a-fA-F_]*[0-9a-fA-F])?)|(0[bB][01]([01_]*[01])?)|(0[oO][0-7]([0-7_]*[0-7])?)|([0-9]([0-9_]*[0-9])?))(i)", validate_imag)]
-    Imag,
-    #[regex(r"(([0-9]([0-9_]*[0-9])?\.[0-9]([0-9_]*[0-9])?([eE][+-]?[0-9]([0-9_]*[0-9])?)?)|([0-9]([0-9_]*[0-9])?[eE][+-]?[0-9]([0-9_]*[0-9])?)|(\.[0-9]([0-9_]*[0-9])?([eE][+-]?[0-9]([0-9_]*[0-9])?)?))(i)", validate_imag)]
-    Imag,
-
-    // --- Operators and delimiters ---
-    #[token("...")]
-    Ellipsis,
-
-    #[token("<<=")]
-    ShlAssign,
-    #[token(">>=")]
-    ShrAssign,
-    #[token("&^=")]
-    AndNotAssign,
-
-    #[token("+=")]
-    AddAssign,
-    #[token("-=")]
-    SubAssign,
-    #[token("*=")]
-    MulAssign,
-    #[token("/=")]
-    DivAssign,
-    #[token("%=")]
-    ModAssign,
-    #[token("&=")]
-    AndAssign,
-    #[token("|=")]
-    OrAssign,
-    #[token("^=")]
-    XorAssign,
-
-    #[token("<<")]
-    Shl,
-    #[token(">>")]
-    Shr,
-    #[token("&^")]
-    AndNot,
-
-    #[token("&&")]
-    LAnd,
-    #[token("||")]
-    LOr,
-
-    #[token("==")]
-    EqEq,
-    #[token("!=")]
-    NotEq,
-    #[token("<=")]
-    Le,
-    #[token(">=")]
-    Ge,
-
-    #[token("++")]
-    Inc,
-    #[token("--")]
-    Dec,
-
-    #[token(":=")]
-    Define,
-    #[token("<-")]
-    Arrow,
-
-    #[token("=")]
-    Assign,
-    #[token("+")]
-    Plus,
-    #[token("-")]
-    Minus,
-    #[token("*")]
-    Star,
-    #[token("/")]
-    Slash,
-    #[token("%")]
-    Percent,
-    #[token("&")]
-    Amp,
-    #[token("|")]
-    Pipe,
-    #[token("^")]
-    Caret,
-    #[token("~")]
-    Tilde,
-    #[token("!")]
-    Bang,
-    #[token("<")]
-    Lt,
-    #[token(">")]
-    Gt,
-
-    #[token("(")]
-    LParen,
-    #[token(")")]
-    RParen,
-    #[token("[")]
-    LBrack,
-    #[token("]")]
-    RBrack,
-    #[token("{")]
-    LBrace,
-    #[token("}")]
-    RBrace,
-
-    #[token(",")]
-    Comma,
-    #[token(";")]
-    Semi,
-    #[token(":")]
-    Colon,
-    #[token(".")]
-    Dot,
-
-    // Anything else.
-    #[regex(r".")]
-    Error,
+    #[regex(r".", priority = 0)] Error,
 }
 
-fn validate_interpreted_string(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
-    // slice includes surrounding quotes
-    let s = lex.slice();
-    // quick checks: no raw newlines due to regex
-    // validate escapes roughly
-    let mut it = s[1..s.len() - 1].chars();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            continue;
+// =============================================================================
+// 2. Lookup Tables (Compile-Time Generated con Macros)
+// =============================================================================
+
+/// Lookup table para clasificación rápida de tipos de token
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokKind {
+    Literal, // Token con payload (requiere slice)
+    Simple,  // Token sin payload (keyword/operador)
+    Trivia,  // Whitespace, comentarios
+}
+
+/// Macro para generar lookup tables de forma declarativa
+macro_rules! gen_lookup_table {
+    (bool, $size:expr, $($variant:ident),* $(,)?) => {{
+        let mut table = [false; $size];
+        $(table[RawTok::$variant as usize] = true;)*
+        table
+    }};
+    ($enum:ty, $size:expr, $default:expr, $($variant:ident => $value:expr),* $(,)?) => {{
+        let mut table = [$default; $size];
+        $(table[RawTok::$variant as usize] = $value;)*
+        table
+    }};
+}
+
+/// Tokens que permiten inserción automática de semicolon
+const SEMI_INSERT_TABLE: [bool; 256] = gen_lookup_table!(
+    bool,
+    256,
+    // Literales
+    Ident,
+    IntBin,
+    IntOct,
+    IntHex,
+    IntDec,
+    Float,
+    Imag,
+    Rune,
+    String,
+    RawString,
+    // Keywords
+    KwBreak,
+    KwContinue,
+    KwFallthrough,
+    KwReturn,
+    // Operadores
+    Inc,
+    Dec,
+    // Delimitadores
+    RParen,
+    RBrack,
+    RBrace,
+);
+
+/// Clasificación de tokens por tipo
+const TOKEN_KIND_TABLE: [TokKind; 256] = gen_lookup_table!(
+    TokKind, 256, TokKind::Simple,
+    // Trivia
+    Newline => TokKind::Trivia,
+    _LineComment => TokKind::Trivia,
+    BlockComment => TokKind::Trivia,
+    // Literales
+    Ident => TokKind::Literal,
+    IntBin => TokKind::Literal,
+    IntOct => TokKind::Literal,
+    IntHex => TokKind::Literal,
+    IntDec => TokKind::Literal,
+    Float => TokKind::Literal,
+    Imag => TokKind::Literal,
+    Rune => TokKind::Literal,
+    String => TokKind::Literal,
+    RawString => TokKind::Literal,
+);
+
+impl RawTok {
+    #[inline(always)]
+    const fn can_insert_semicolon(self) -> bool {
+        SEMI_INSERT_TABLE[self as usize]
+    }
+
+    #[inline(always)]
+    const fn kind(self) -> TokKind {
+        TOKEN_KIND_TABLE[self as usize]
+    }
+
+    /// Convierte RawTok a Tok usando dispatch especializado
+    #[inline]
+    const fn to_token<'src>(self, slice: &'src str) -> Tok<'src> {
+        // Branch prediction favorecerá literales (más comunes)
+        if matches!(self.kind(), TokKind::Literal) {
+            return match self {
+                Self::Ident => Tok::Ident(slice),
+                Self::IntBin | Self::IntOct | Self::IntHex | Self::IntDec => Tok::IntLit(slice),
+                Self::Float => Tok::FloatLit(slice),
+                Self::Imag => Tok::ImagLit(slice),
+                Self::Rune => Tok::RuneLit(slice),
+                Self::String => Tok::StringLit(slice),
+                Self::RawString => Tok::RawStringLit(slice),
+                _ => unreachable!(),
+            };
         }
-        match it.next() {
-            Some('a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' | '\\' | '"' | '\'' ) => {}
-            Some('x') => {
-                let h1 = it.next().ok_or(LexErrorKind::InvalidEscape)?;
-                let h2 = it.next().ok_or(LexErrorKind::InvalidEscape)?;
-                if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
-                    return Err(LexErrorKind::InvalidEscape);
+
+        // Keywords y operadores (uso de macro para reducir código)
+        macro_rules! simple_tok {
+            ($($raw:ident => $tok:ident),* $(,)?) => {
+                match self {
+                    $(Self::$raw => Tok::$tok,)*
+                    _ => unreachable!(),
                 }
-            }
-            Some('u') => {
-                for _ in 0..4 {
-                    let h = it.next().ok_or(LexErrorKind::InvalidEscape)?;
-                    if !h.is_ascii_hexdigit() {
-                        return Err(LexErrorKind::InvalidEscape);
-                    }
-                }
-            }
-            Some('U') => {
-                for _ in 0..8 {
-                    let h = it.next().ok_or(LexErrorKind::InvalidEscape)?;
-                    if !h.is_ascii_hexdigit() {
-                        return Err(LexErrorKind::InvalidEscape);
-                    }
-                }
-            }
-            Some('0'..='7') => {
-                // octal: up to 2 more digits
-                for _ in 0..2 {
-                    if let Some(peek) = it.clone().next() {
-                        if ('0'..='7').contains(&peek) {
-                            it.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => return Err(LexErrorKind::InvalidEscape),
+            };
+        }
+
+        simple_tok! {
+            KwBreak => KwBreak, KwCase => KwCase, KwChan => KwChan, KwConst => KwConst,
+            KwContinue => KwContinue, KwDefault => KwDefault, KwDefer => KwDefer, KwElse => KwElse,
+            KwFallthrough => KwFallthrough, KwFor => KwFor, KwFunc => KwFunc, KwGo => KwGo,
+            KwGoto => KwGoto, KwIf => KwIf, KwImport => KwImport, KwInterface => KwInterface,
+            KwMap => KwMap, KwPackage => KwPackage, KwRange => KwRange, KwReturn => KwReturn,
+            KwSelect => KwSelect, KwStruct => KwStruct, KwSwitch => KwSwitch, KwType => KwType, KwVar => KwVar,
+            Ellipsis => Ellipsis, ShlAssign => ShlAssign, ShrAssign => ShrAssign, AndNotAssign => AndNotAssign,
+            AddAssign => AddAssign, SubAssign => SubAssign, MulAssign => MulAssign, DivAssign => DivAssign,
+            ModAssign => ModAssign, AndAssign => AndAssign, OrAssign => OrAssign, XorAssign => XorAssign,
+            Shl => Shl, Shr => Shr, AndNot => AndNot, LAnd => LAnd, LOr => LOr, EqEq => EqEq, NotEq => NotEq,
+            Le => Le, Ge => Ge, Inc => Inc, Dec => Dec, Define => Define, Arrow => Arrow, Assign => Assign,
+            Plus => Plus, Minus => Minus, Star => Star, Slash => Slash, Percent => Percent, Amp => Amp,
+            Pipe => Pipe, Caret => Caret, Tilde => Tilde, Bang => Bang, Lt => Lt, Gt => Gt,
+            LParen => LParen, RParen => RParen, LBrack => LBrack, RBrack => RBrack, LBrace => LBrace,
+            RBrace => RBrace, Comma => Comma, Semi => Semi, Colon => Colon, Dot => Dot, Error => Error,
         }
     }
-    Ok(())
 }
 
-fn validate_rune_lit(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
-    // Very conservative: ensure it's at least one char between quotes; regex already guarantees.
-    // Validate escapes using the same rules as strings.
-    let s = lex.slice();
-    if s.len() < 3 {
+// =============================================================================
+// 3. Validation Functions (Optimized with Macros & Lookup Tables)
+// =============================================================================
+
+/// Tipo de escape sequence
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum EscapeKind {
+    Invalid = 0,
+    Simple = 1, // \n, \t, etc.
+    Hex2 = 2,   // \xNN
+    Hex4 = 4,   // \uNNNN
+    Hex8 = 8,   // \UNNNNNNNN
+    Octal = 16, // \NNN
+}
+
+/// Macro para generar digit lookup tables
+macro_rules! gen_digit_table {
+    (hex) => {{
+        let mut table = [false; 256];
+        let mut i = 0;
+        while i < 10 {
+            table[(b'0' as usize) + i] = true;
+            i += 1;
+        }
+        i = 0;
+        while i < 6 {
+            table[(b'a' as usize) + i] = true;
+            table[(b'A' as usize) + i] = true;
+            i += 1;
+        }
+        table
+    }};
+    (octal) => {{
+        let mut table = [false; 256];
+        let mut i = 0;
+        while i < 8 {
+            table[(b'0' as usize) + i] = true;
+            i += 1;
+        }
+        table
+    }};
+}
+
+/// Lookup tables para validación de dígitos (const, branchless)
+const HEX_DIGIT_TABLE: [bool; 256] = gen_digit_table!(hex);
+const OCTAL_DIGIT_TABLE: [bool; 256] = gen_digit_table!(octal);
+
+/// Lookup table para escape sequences
+const ESCAPE_TABLE: [EscapeKind; 256] = {
+    let mut table = [EscapeKind::Invalid; 256];
+    // Simple escapes
+    let simple = [b'a', b'b', b'f', b'n', b'r', b't', b'v', b'\\', b'"', b'\''];
+    let mut i = 0;
+    while i < simple.len() {
+        table[simple[i] as usize] = EscapeKind::Simple;
+        i += 1;
+    }
+    // Hex escapes
+    table[b'x' as usize] = EscapeKind::Hex2;
+    table[b'u' as usize] = EscapeKind::Hex4;
+    table[b'U' as usize] = EscapeKind::Hex8;
+    // Octal escapes (0-7)
+    i = 0;
+    while i < 8 {
+        table[(b'0' as usize) + i] = EscapeKind::Octal;
+        i += 1;
+    }
+    table
+};
+
+#[inline(always)]
+const fn is_hex_digit(byte: u8) -> bool {
+    HEX_DIGIT_TABLE[byte as usize]
+}
+
+#[inline(always)]
+const fn is_octal_digit(byte: u8) -> bool {
+    OCTAL_DIGIT_TABLE[byte as usize]
+}
+
+/// Valida N bytes hexadecimales consecutivos (optimizado)
+#[inline]
+fn validate_hex_bytes(bytes: &[u8], start: usize, count: usize) -> Result<(), LexErrorKind> {
+    // Check bounds una sola vez
+    let slice = bytes
+        .get(start..start.wrapping_add(count))
+        .ok_or(LexErrorKind::InvalidEscape)?;
+
+    // Optimización: el compilador puede vectorizar este loop
+    slice
+        .iter()
+        .all(|&b| is_hex_digit(b))
+        .then_some(())
+        .ok_or(LexErrorKind::InvalidEscape)
+}
+
+/// Valida escape sequences (single-pass, lookup-based)
+#[inline]
+fn validate_escapes(s: &str) -> Result<(), LexErrorKind> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    if len < 2 {
         return Err(LexErrorKind::InvalidToken);
     }
-    // rune literal shares escape forms; allow 1+ content for now.
-    // (A strict "single rune" check is done at semantic stage; for parsing we only need tokenization.)
-    // Reuse the string escape validator by wrapping in quotes.
-    let mut fake = String::with_capacity(s.len());
-    fake.push('"');
-    fake.push_str(&s[1..s.len() - 1]);
-    fake.push('"');
 
-    // local escape scan
-    let mut it = fake[1..fake.len() - 1].chars();
-    while let Some(c) = it.next() {
-        if c != '\\' {
+    let mut i = 1; // Skip opening quote
+
+    while i < len - 1 {
+        if bytes[i] != b'\\' {
+            i += 1;
             continue;
         }
-        match it.next() {
-            Some('a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' | '\\' | '"' | '\'' ) => {}
-            Some('x') => {
-                let h1 = it.next().ok_or(LexErrorKind::InvalidEscape)?;
-                let h2 = it.next().ok_or(LexErrorKind::InvalidEscape)?;
-                if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
-                    return Err(LexErrorKind::InvalidEscape);
+
+        i += 1;
+        if i >= len - 1 {
+            return Err(LexErrorKind::InvalidEscape);
+        }
+
+        // Dispatch optimizado usando lookup table
+        match ESCAPE_TABLE[bytes[i] as usize] {
+            EscapeKind::Simple => i += 1,
+            EscapeKind::Hex2 => {
+                i += 1;
+                validate_hex_bytes(bytes, i, 2)?;
+                i += 2;
+            }
+            EscapeKind::Hex4 => {
+                i += 1;
+                validate_hex_bytes(bytes, i, 4)?;
+                i += 4;
+            }
+            EscapeKind::Hex8 => {
+                i += 1;
+                validate_hex_bytes(bytes, i, 8)?;
+                i += 8;
+            }
+            EscapeKind::Octal => {
+                i += 1;
+                // Consume hasta 2 octales adicionales
+                let mut count = 0;
+                while count < 2 && i < len - 1 && is_octal_digit(bytes[i]) {
+                    i += 1;
+                    count += 1;
                 }
             }
-            Some('u') => {
-                for _ in 0..4 {
-                    let h = it.next().ok_or(LexErrorKind::InvalidEscape)?;
-                    if !h.is_ascii_hexdigit() {
-                        return Err(LexErrorKind::InvalidEscape);
-                    }
-                }
-            }
-            Some('U') => {
-                for _ in 0..8 {
-                    let h = it.next().ok_or(LexErrorKind::InvalidEscape)?;
-                    if !h.is_ascii_hexdigit() {
-                        return Err(LexErrorKind::InvalidEscape);
-                    }
-                }
-            }
-            Some('0'..='7') => {
-                for _ in 0..2 {
-                    if let Some(peek) = it.clone().next() {
-                        if ('0'..='7').contains(&peek) {
-                            it.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => return Err(LexErrorKind::InvalidEscape),
+            EscapeKind::Invalid => return Err(LexErrorKind::InvalidEscape),
         }
     }
 
     Ok(())
 }
 
+#[inline]
+fn validate_interpreted_string(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
+    validate_escapes(lex.slice())
+}
+
+#[inline]
+fn validate_rune_lit(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
+    let s = lex.slice();
+    (s.len() >= 3)
+        .then_some(())
+        .ok_or(LexErrorKind::InvalidToken)?;
+    validate_escapes(s)
+}
+
+/// Valida número (optimizado para hot path)
+#[inline]
 fn validate_number(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
-    let s = lex.slice();
-    if s.starts_with('_') || s.ends_with('_') || s.contains("__") {
+    let bytes = lex.slice().as_bytes();
+
+    // Fast path: check common error conditions
+    if bytes.is_empty()
+        || bytes[0] == b'_'
+        || bytes[bytes.len() - 1] == b'_'
+        || bytes.windows(2).any(|w| w == b"__")
+    {
         return Err(LexErrorKind::InvalidNumber);
     }
+
     Ok(())
 }
 
+#[inline]
 fn validate_imag(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
-    let s = lex.slice();
-    if !s.ends_with('i') {
-        return Err(LexErrorKind::InvalidNumber);
-    }
-    Ok(())
+    lex.slice()
+        .ends_with('i')
+        .then_some(())
+        .ok_or(LexErrorKind::InvalidNumber)?;
+    validate_number(lex)
 }
 
-/// Tokens exposed to LALRPOP.
+// =============================================================================
+// 4. Public Token Definition
+// =============================================================================
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Tok {
-    // Identifiers + literals
-    Ident(String),
-    IntLit(String),
-    FloatLit(String),
-    ImagLit(String),
-    RuneLit(String),
-    StringLit(String),
-    RawStringLit(String),
+pub enum Tok<'input> {
+    Ident(&'input str),
+    IntLit(&'input str),
+    FloatLit(&'input str),
+    ImagLit(&'input str),
+    RuneLit(&'input str),
+    StringLit(&'input str),
+    RawStringLit(&'input str),
 
     // Keywords
     KwBreak,
-    KwDefault,
-    KwFunc,
-    KwInterface,
-    KwSelect,
     KwCase,
-    KwDefer,
-    KwGo,
-    KwMap,
-    KwStruct,
     KwChan,
-    KwElse,
-    KwGoto,
-    KwPackage,
-    KwSwitch,
     KwConst,
-    KwFallthrough,
-    KwIf,
-    KwRange,
-    KwType,
     KwContinue,
+    KwDefault,
+    KwDefer,
+    KwElse,
+    KwFallthrough,
     KwFor,
+    KwFunc,
+    KwGo,
+    KwGoto,
+    KwIf,
     KwImport,
+    KwInterface,
+    KwMap,
+    KwPackage,
+    KwRange,
     KwReturn,
+    KwSelect,
+    KwStruct,
+    KwSwitch,
+    KwType,
     KwVar,
 
-    // Operators and punctuation
+    // Operators
     Ellipsis,
-
     ShlAssign,
     ShrAssign,
     AndNotAssign,
@@ -362,25 +491,19 @@ pub enum Tok {
     AndAssign,
     OrAssign,
     XorAssign,
-
     Shl,
     Shr,
     AndNot,
-
     LAnd,
     LOr,
-
     EqEq,
     NotEq,
     Le,
     Ge,
-
     Inc,
     Dec,
-
     Define,
     Arrow,
-
     Assign,
     Plus,
     Minus,
@@ -394,28 +517,33 @@ pub enum Tok {
     Bang,
     Lt,
     Gt,
-
     LParen,
     RParen,
     LBrack,
     RBrack,
     LBrace,
     RBrace,
-
     Comma,
     Semi,
     Colon,
     Dot,
 
-    // Error token (to allow parser recovery).
     Error,
 }
 
-pub type SpannedTok = (usize, Tok, usize);
+impl<'input> std::fmt::Display for Tok<'input> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+// =============================================================================
+// 5. Lexer with Semicolon Insertion Logic (Simplified)
+// =============================================================================
 
 pub struct Lexer<'src> {
     logos: LogosLexer<'src, RawTok>,
-    pending: VecDeque<SpannedTok>,
+    pending: Option<(usize, Tok<'src>, usize)>,
     diags: Vec<Diag>,
     last_can_insert_semi: bool,
     src_len: usize,
@@ -426,8 +554,8 @@ impl<'src> Lexer<'src> {
     pub fn new(input: &'src str) -> Self {
         Self {
             logos: RawTok::lexer(input),
-            pending: VecDeque::new(),
-            diags: Vec::new(),
+            pending: None,
+            diags: Vec::with_capacity(16),
             last_can_insert_semi: false,
             src_len: input.len(),
             eof_done: false,
@@ -438,111 +566,61 @@ impl<'src> Lexer<'src> {
         std::mem::take(&mut self.diags)
     }
 
+    #[inline]
     fn push_lex_diag(&mut self, kind: LexErrorKind, span: std::ops::Range<usize>) {
-        let err = LexError { kind, span };
-        self.diags.push(err.diag());
+        self.diags.push(LexError { kind, span }.diag());
     }
 
-    fn map_ident_or_keyword(&self, s: &str) -> Tok {
-        match s {
-            "break" => Tok::KwBreak,
-            "default" => Tok::KwDefault,
-            "func" => Tok::KwFunc,
-            "interface" => Tok::KwInterface,
-            "select" => Tok::KwSelect,
-            "case" => Tok::KwCase,
-            "defer" => Tok::KwDefer,
-            "go" => Tok::KwGo,
-            "map" => Tok::KwMap,
-            "struct" => Tok::KwStruct,
-            "chan" => Tok::KwChan,
-            "else" => Tok::KwElse,
-            "goto" => Tok::KwGoto,
-            "package" => Tok::KwPackage,
-            "switch" => Tok::KwSwitch,
-            "const" => Tok::KwConst,
-            "fallthrough" => Tok::KwFallthrough,
-            "if" => Tok::KwIf,
-            "range" => Tok::KwRange,
-            "type" => Tok::KwType,
-            "continue" => Tok::KwContinue,
-            "for" => Tok::KwFor,
-            "import" => Tok::KwImport,
-            "return" => Tok::KwReturn,
-            "var" => Tok::KwVar,
-            _ => Tok::Ident(s.to_string()),
-        }
-    }
-
-    fn can_insert_semi_after(tok: &Tok) -> bool {
-        matches!(
-            tok,
-            Tok::Ident(_)
-                | Tok::IntLit(_)
-                | Tok::FloatLit(_)
-                | Tok::ImagLit(_)
-                | Tok::RuneLit(_)
-                | Tok::StringLit(_)
-                | Tok::RawStringLit(_)
-                | Tok::KwBreak
-                | Tok::KwContinue
-                | Tok::KwFallthrough
-                | Tok::KwReturn
-                | Tok::Inc
-                | Tok::Dec
-                | Tok::RParen
-                | Tok::RBrack
-                | Tok::RBrace
-        )
-    }
-
+    #[inline]
     fn emit_semi_at(&mut self, pos: usize) {
-        self.pending.push_back((pos, Tok::Semi, pos));
+        self.pending = Some((pos, Tok::Semi, pos));
     }
 
-    fn lex_next_raw(&mut self) -> Option<Result<RawTok, LexErrorKind>> {
-        self.logos.next()
-    }
-
-    fn validate_identifier_unicode(s: &str) -> bool {
-        let mut chars = s.chars();
-        let Some(first) = chars.next() else { return false };
-        if first != '_' && !is_xid_start(first) {
-            return false;
-        }
-        for c in chars {
-            if c != '_' && !is_xid_continue(c) {
-                return false;
+    /// Maneja trivia y determina si debe insertarse semicolon
+    #[inline]
+    fn handle_trivia(&mut self, raw: RawTok, span: &std::ops::Range<usize>, slice: &str) -> bool {
+        match raw {
+            RawTok::Newline => {
+                if self.last_can_insert_semi {
+                    self.last_can_insert_semi = false;
+                    self.emit_semi_at(span.start);
+                }
+                true
             }
+            RawTok::BlockComment if slice.contains(['\n', '\r']) => {
+                if self.last_can_insert_semi {
+                    self.last_can_insert_semi = false;
+                    self.emit_semi_at(span.end);
+                }
+                true
+            }
+            RawTok::BlockComment => true,
+            _ => false,
         }
-        true
     }
 }
 
-impl Iterator for Lexer<'_> {
-    type Item = (usize, Tok, usize);
+impl<'src> Iterator for Lexer<'src> {
+    type Item = (usize, Tok<'src>, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(sp) = self.pending.pop_front() {
-            return Some(sp);
-        }
-
-        if self.eof_done {
-            return None;
-        }
-
         loop {
-            if let Some(sp) = self.pending.pop_front() {
-                return Some(sp);
+            // Return pending semicolon if any
+            if let Some(tok) = self.pending.take() {
+                return Some(tok);
             }
 
-            match self.lex_next_raw() {
+            if self.eof_done {
+                return None;
+            }
+
+            match self.logos.next() {
                 None => {
                     self.eof_done = true;
                     if self.last_can_insert_semi {
                         self.last_can_insert_semi = false;
                         self.emit_semi_at(self.src_len);
-                        return self.pending.pop_front();
+                        continue;
                     }
                     return None;
                 }
@@ -556,157 +634,26 @@ impl Iterator for Lexer<'_> {
                     let span = self.logos.span();
                     let slice = self.logos.slice();
 
-                    match raw {
-                        RawTok::Newline => {
-                            // Go semicolon insertion: when newline is seen, insert ';' if previous token qualifies.
-                            if self.last_can_insert_semi {
-                                self.last_can_insert_semi = false;
-                                self.emit_semi_at(span.start);
-                            }
-                            continue;
-                        }
-                        RawTok::BlockComment => {
-                            // If comment contains a newline, treat it like a newline boundary.
-                            if slice.contains('\n') || slice.contains('\r') {
-                                if self.last_can_insert_semi {
-                                    self.last_can_insert_semi = false;
-                                    self.emit_semi_at(span.end);
-                                }
-                            }
-                            continue;
-                        }
-                        RawTok::Error => {
-                            self.push_lex_diag(LexErrorKind::InvalidToken, span.clone());
-                            self.last_can_insert_semi = false;
-                            return Some((span.start, Tok::Error, span.end));
-                        }
-                        RawTok::Ident => {
-                            if !Self::validate_identifier_unicode(slice) {
-                                self.push_lex_diag(LexErrorKind::InvalidToken, span.clone());
-                                self.last_can_insert_semi = false;
-                                return Some((span.start, Tok::Error, span.end));
-                            }
-                            let tok = self.map_ident_or_keyword(slice);
-                            self.last_can_insert_semi = Self::can_insert_semi_after(&tok);
-                            return Some((span.start, tok, span.end));
-                        }
-                        RawTok::Int => {
-                            let tok = Tok::IntLit(slice.to_string());
-                            self.last_can_insert_semi = true;
-                            return Some((span.start, tok, span.end));
-                        }
-                        RawTok::Float => {
-                            let tok = Tok::FloatLit(slice.to_string());
-                            self.last_can_insert_semi = true;
-                            return Some((span.start, tok, span.end));
-                        }
-                        RawTok::Imag => {
-                            let tok = Tok::ImagLit(slice.to_string());
-                            self.last_can_insert_semi = true;
-                            return Some((span.start, tok, span.end));
-                        }
-                        RawTok::Rune => {
-                            let tok = Tok::RuneLit(slice.to_string());
-                            self.last_can_insert_semi = true;
-                            return Some((span.start, tok, span.end));
-                        }
-                        RawTok::String => {
-                            let tok = Tok::StringLit(slice.to_string());
-                            self.last_can_insert_semi = true;
-                            return Some((span.start, tok, span.end));
-                        }
-                        RawTok::RawString => {
-                            let tok = Tok::RawStringLit(slice.to_string());
-                            self.last_can_insert_semi = true;
-                            return Some((span.start, tok, span.end));
-                        }
-
-                        // Punct / ops: map 1:1
-                        other => {
-                            let tok = match other {
-                                RawTok::Ellipsis => Tok::Ellipsis,
-                                RawTok::ShlAssign => Tok::ShlAssign,
-                                RawTok::ShrAssign => Tok::ShrAssign,
-                                RawTok::AndNotAssign => Tok::AndNotAssign,
-                                RawTok::AddAssign => Tok::AddAssign,
-                                RawTok::SubAssign => Tok::SubAssign,
-                                RawTok::MulAssign => Tok::MulAssign,
-                                RawTok::DivAssign => Tok::DivAssign,
-                                RawTok::ModAssign => Tok::ModAssign,
-                                RawTok::AndAssign => Tok::AndAssign,
-                                RawTok::OrAssign => Tok::OrAssign,
-                                RawTok::XorAssign => Tok::XorAssign,
-                                RawTok::Shl => Tok::Shl,
-                                RawTok::Shr => Tok::Shr,
-                                RawTok::AndNot => Tok::AndNot,
-                                RawTok::LAnd => Tok::LAnd,
-                                RawTok::LOr => Tok::LOr,
-                                RawTok::EqEq => Tok::EqEq,
-                                RawTok::NotEq => Tok::NotEq,
-                                RawTok::Le => Tok::Le,
-                                RawTok::Ge => Tok::Ge,
-                                RawTok::Inc => Tok::Inc,
-                                RawTok::Dec => Tok::Dec,
-                                RawTok::Define => Tok::Define,
-                                RawTok::Arrow => Tok::Arrow,
-                                RawTok::Assign => Tok::Assign,
-                                RawTok::Plus => Tok::Plus,
-                                RawTok::Minus => Tok::Minus,
-                                RawTok::Star => Tok::Star,
-                                RawTok::Slash => Tok::Slash,
-                                RawTok::Percent => Tok::Percent,
-                                RawTok::Amp => Tok::Amp,
-                                RawTok::Pipe => Tok::Pipe,
-                                RawTok::Caret => Tok::Caret,
-                                RawTok::Tilde => Tok::Tilde,
-                                RawTok::Bang => Tok::Bang,
-                                RawTok::Lt => Tok::Lt,
-                                RawTok::Gt => Tok::Gt,
-                                RawTok::LParen => Tok::LParen,
-                                RawTok::RParen => Tok::RParen,
-                                RawTok::LBrack => Tok::LBrack,
-                                RawTok::RBrack => Tok::RBrack,
-                                RawTok::LBrace => Tok::LBrace,
-                                RawTok::RBrace => Tok::RBrace,
-                                RawTok::Comma => Tok::Comma,
-                                RawTok::Semi => Tok::Semi,
-                                RawTok::Colon => Tok::Colon,
-                                RawTok::Dot => Tok::Dot,
-                                _ => {
-                                    // should be impossible
-                                    Tok::Error
-                                }
-                            };
-
-                            self.last_can_insert_semi = Self::can_insert_semi_after(&tok);
-                            return Some((span.start, tok, span.end));
-                        }
+                    // Handle trivia (skip whitespace, comments)
+                    if self.handle_trivia(raw, &span, slice) {
+                        continue;
                     }
+
+                    // Handle errors
+                    if raw == RawTok::Error {
+                        self.push_lex_diag(LexErrorKind::InvalidToken, span.clone());
+                        self.last_can_insert_semi = false;
+                        return Some((span.start, Tok::Error, span.end));
+                    }
+
+                    // Update semicolon insertion flag (branchless lookup)
+                    self.last_can_insert_semi = raw.can_insert_semicolon();
+
+                    // Convert and return token
+                    let tok = raw.to_token(slice);
+                    return Some((span.start, tok, span.end));
                 }
             }
         }
     }
 }
-
-impl Tok {
-    /// Human-friendly classification for semicolon insertion decisions.
-    pub fn is_basic_lit(&self) -> bool {
-        matches!(
-            self,
-            Tok::IntLit(_)
-                | Tok::FloatLit(_)
-                | Tok::ImagLit(_)
-                | Tok::RuneLit(_)
-                | Tok::StringLit(_)
-                | Tok::RawStringLit(_)
-        )
-    }
-}
-
-// Provide a minimal Display-ish for debugging.
-impl std::fmt::Display for Tok {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-

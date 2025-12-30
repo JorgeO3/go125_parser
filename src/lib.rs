@@ -7,7 +7,7 @@ pub mod ast;
 pub mod error;
 pub mod lexer;
 
-lalrpop_util::lalrpop_mod!(pub grammar);
+// lalrpop_util::lalrpop_mod!(pub grammar);
 
 use crate::ast::SourceFile;
 use crate::error::{Diag, ParseFailure};
@@ -28,10 +28,16 @@ pub fn parse_source(input: &str) -> Result<SourceFile, ParseFailure> {
 
     match parsed {
         Ok(sf) if diags.is_empty() => Ok(sf),
-        Ok(sf) => Err(ParseFailure { partial: Some(sf), diags }),
+        Ok(sf) => Err(ParseFailure {
+            partial: Some(sf),
+            diags,
+        }),
         Err(e) => {
             diags.push(crate::error::from_parse_error(e));
-            Err(ParseFailure { partial: None, diags })
+            Err(ParseFailure {
+                partial: None,
+                diags,
+            })
         }
     }
 }
