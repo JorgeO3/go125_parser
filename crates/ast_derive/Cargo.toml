@@ -1,0 +1,13 @@
+[package]
+name = "ast_derive"
+version = "0.1.0"
+edition = "2024"
+resolver = "3"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

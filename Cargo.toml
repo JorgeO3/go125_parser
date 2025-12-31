@@ -1,48 +1,5 @@
-[package]
-name = "go125_parser"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+[workspace]
+members = ["crates/parser", "crates/ast_derive"]
+resolver = "3"
 
-[dependencies]
-logos = "0.16.0"
-lalrpop-util = "0.22.2"
-thiserror = "2.0.17"
-unicode-ident = "1.0.22"
-smallvec = "1.15.1"
-bumpalo = "3.19.1"
-la-arena = "0.3.1"
-smol_str = "0.3.4"
-
-[build-dependencies]
-lalrpop = "0.22"
-
-[dev-dependencies]
-pretty_assertions = "1"
-walkdir = "2"
-criterion = { version = "0.8.1", features = ["html_reports"] }
-
-[profile.dev.build-override]
-opt-level = 3
-debug = 0
-
-[profile.release]
-opt-level = 3
-debug = "full"
-lto = true
-codegen-units = 1
-strip = false
-
-[profile.bench]
-inherits = "release"
-opt-level = 3
-debug = 1            # suficiente para flamegraphs/perf sin inflar demasiado
-lto = "thin"         # gran parte del beneficio, compila mucho más rápido que full lto
-codegen-units = 4    # reduce tiempo de compile, performance sigue muy cerca
-strip = "none"
-panic = "abort"      # reduce overhead y tamaño; para benches suele estar bien
-incremental = true   # acelera iteración en local
-
-[[bench]]
-name = "parser_benchmark"
-harness = false
+[workspace.dependencies]

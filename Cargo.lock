@@ -42,6 +42,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ast_derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -332,6 +341,7 @@ dependencies = [
 name = "go125_parser"
 version = "0.1.0"
 dependencies = [
+ "ast_derive",
  "bumpalo",
  "criterion",
  "la-arena",

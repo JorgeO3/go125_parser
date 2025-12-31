@@ -1,0 +1,35 @@
+[package]
+name = "go125_parser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+logos = "0.16.0"
+lalrpop-util = "0.22.2"
+thiserror = "2.0.17"
+unicode-ident = "1.0.22"
+smallvec = "1.15.1"
+bumpalo = "3.19.1"
+la-arena = "0.3.1"
+smol_str = "0.3.4"
+ast_derive = { path = "../ast_derive" }
+
+[build-dependencies]
+lalrpop = "0.22"
+
+[dev-dependencies]
+pretty_assertions = "1"
+walkdir = "2"
+criterion = { version = "0.8.1", features = ["html_reports"] }
+
+[profile.dev.build-override]
+opt-level = 3
+debug = 0
+
+[profile.release]
+opt-level = 3
+debug = "full"
+lto = true
+codegen-units = 1
+strip = false
