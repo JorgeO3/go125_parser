@@ -25,6 +25,7 @@ use core::marker::PhantomData;
 use core::ops::{Index, IndexMut};
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 // =============================================================================
 // Core: IDs, Span, ListRef
@@ -136,18 +137,52 @@ impl Symbol {
 pub type Ident = Symbol;
 
 /// Very fast, deterministic 64-bit FNV-1a hash (good enough for an interner).
-#[inline]
-fn fnv1a64(bytes: &[u8]) -> u64 {
+///
+/// Versión optimizada para const evaluation (LLVM puede unroll el loop fácilmente).
+/// El while loop con índice manual permite:
+/// - Uso en contextos const (iteradores no disponibles)
+/// - Mejor auto-vectorización por LLVM
+/// - Loop unrolling más agresivo
+const fn fnv1a64(bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
 
     let mut h = OFFSET;
-    for &b in bytes {
-        h ^= b as u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
         h = h.wrapping_mul(PRIME);
+        i += 1;
     }
     h
 }
+
+#[derive(Default)]
+struct U64IdentityHasher(u64);
+
+impl Hasher for U64IdentityHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // fallback: solo para completeness; nuestro hot path es write_u64
+        let mut h = 0u64;
+        for &b in bytes {
+            h = h.wrapping_mul(131).wrapping_add(b as u64);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type U64NoHash = BuildHasherDefault<U64IdentityHasher>;
 
 /// Simple string interner optimized to avoid double-allocations/clones.
 ///
@@ -159,13 +194,16 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[derive(Debug, Default)]
 pub struct Interner {
     strings: Vec<Box<str>>,
-    buckets: HashMap<u64, SmallVec<[Symbol; 1]>>,
+    buckets: HashMap<u64, SmallVec<[Symbol; 1]>, U64NoHash>,
 }
 
 impl Interner {
     #[inline]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            strings: Vec::new(),
+            buckets: HashMap::with_hasher(U64NoHash::default()),
+        }
     }
 
     #[inline]
@@ -183,22 +221,17 @@ impl Interner {
     /// Hot path: no allocations on hits; on misses, only one allocation for the canonical string.
     pub fn intern(&mut self, s: &str) -> Symbol {
         let h = fnv1a64(s.as_bytes());
+        let cands = self.buckets.entry(h).or_default();
 
-        if let Some(cands) = self.buckets.get(&h) {
-            // Collision check: usually 1 candidate.
-            for &sym in cands {
-                if self.strings[sym.as_u32() as usize].as_ref() == s {
-                    return sym;
-                }
+        for &sym in cands.iter() {
+            if self.strings[sym.as_u32() as usize].as_ref() == s {
+                return sym;
             }
         }
 
-        // Miss: allocate exactly once for canonical storage.
         let sym = Symbol::from_u32(self.strings.len() as u32);
         self.strings.push(s.into());
-
-        self.buckets.entry(h).or_default().push(sym);
-
+        cands.push(sym);
         sym
     }
 
@@ -695,7 +728,7 @@ pub enum Spec {
     Type(TypeSpec),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub struct ImportSpec {
     pub name: Option<Ident>,
     pub path: StringLit,
@@ -704,7 +737,7 @@ pub struct ImportSpec {
 /// Value specification: moved dynamic lists into `ListRef` to avoid per-node Vec allocations.
 ///
 /// The parser should build these lists using `arena.list_idents(...)` and `arena.list_exprs(...)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub struct ValueSpec {
     pub names: ListRef, // Ident[]
     pub typ: Option<TypeId>,
@@ -733,13 +766,13 @@ pub struct FuncDecl {
     pub body: Option<Block>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub struct Signature {
     pub params: FieldList,
     pub results: Option<Results>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum Results {
     Params(FieldList),
     Type(TypeId),
@@ -762,7 +795,7 @@ pub struct FieldList {
     pub fields: ListRef, // FieldId[]
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 pub struct Field {
     pub names: ListRef, // Ident[]
     pub typ: TypeId,
@@ -956,7 +989,7 @@ pub enum CommStmt {
 // Expressions
 // =============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum Expr {
     Ident(Ident),
     BasicLit(BasicLit),
@@ -1095,7 +1128,7 @@ pub enum BinaryOp {
 // Types
 // =============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum Type {
     Named(NamedType),
 
@@ -1124,7 +1157,7 @@ pub enum Type {
     ExprFallback(ExprId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub struct NamedType {
     pub pkg: Option<Ident>,
     pub name: Ident,

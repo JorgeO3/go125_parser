@@ -1,1 +1,20 @@
 /target
+
+# Profiling artifacts
+perf.data
+perf.data.old
+flamegraph.svg
+*.data
+
+# Benchmark/test outputs
+*.txt
+bench_results.txt
+output*.txt
+asm.txt
+
+# Editor artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
