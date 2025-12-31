@@ -20,6 +20,7 @@ lalrpop = "0.22"
 [dev-dependencies]
 pretty_assertions = "1"
 walkdir = "2"
+criterion = { version = "0.8.1", features = ["html_reports"] }
 
 [profile.dev.build-override]
 opt-level = 3
@@ -30,3 +31,18 @@ opt-level = 3
 debug = "full"
 lto = true
 codegen-units = 1
+strip = false
+
+[profile.bench]
+inherits = "release"
+opt-level = 3
+debug = 1            # suficiente para flamegraphs/perf sin inflar demasiado
+lto = "thin"         # gran parte del beneficio, compila mucho más rápido que full lto
+codegen-units = 4    # reduce tiempo de compile, performance sigue muy cerca
+strip = "none"
+panic = "abort"      # reduce overhead y tamaño; para benches suele estar bien
+incremental = true   # acelera iteración en local
+
+[[bench]]
+name = "parser_benchmark"
+harness = false

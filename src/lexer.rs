@@ -568,7 +568,8 @@ impl<'src> Lexer<'src> {
 
     #[inline]
     fn push_lex_diag(&mut self, kind: LexErrorKind, span: std::ops::Range<usize>) {
-        self.diags.push(LexError { kind, span }.diag());
+        let sp = crate::error::Span::from_range(span);
+        self.diags.push(LexError { kind, span: sp }.diag());
     }
 
     #[inline]
