@@ -170,6 +170,7 @@ impl_list_slice! {
     CommentId => comment_ids,
     CommentGroupId => comment_group_ids,
     ExprOrType => expr_or_types,
+    Span => spans_list,
 }
 
 // Utilities

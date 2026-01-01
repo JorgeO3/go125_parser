@@ -443,6 +443,7 @@ pub struct ExtraData {
     pub comment_ids: Vec<CommentId>,
     pub comment_group_ids: Vec<CommentGroupId>,
     pub expr_or_types: Vec<ExprOrType>,
+    pub spans: Vec<Span>,
 }
 
 // =============================================================================
@@ -603,6 +604,10 @@ impl AstArena {
         Self::push_list(&mut self.extras.expr_or_types, i)
     }
 
+    pub fn list_spans(&mut self, i: impl IntoIterator<Item = Span>) -> ListRef<Span> {
+        Self::push_list(&mut self.extras.spans, i)
+    }
+
     // List Accessors
 
     pub fn idents(&self, r: ListRef<Ident>) -> &[Ident] {
@@ -675,6 +680,10 @@ impl AstArena {
 
     pub fn expr_or_types(&self, r: ListRef<ExprOrType>) -> &[ExprOrType] {
         Self::slice(&self.extras.expr_or_types, r)
+    }
+
+    pub fn spans_list(&self, r: ListRef<Span>) -> &[Span] {
+        Self::slice(&self.extras.spans, r)
     }
 }
 
@@ -788,12 +797,16 @@ pub enum Spec {
 /// Spec: `ImportSpec = [ "." | PackageName ] ImportPath`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WalkAst)]
 pub struct ImportSpec {
+    /// Full span of this spec (value-stored; not arena-allocated).
+    pub span: Span,
     /// Leading doc comment group (optional)
     pub doc: Option<CommentGroupId>,
     /// Optional import name (dot import, blank, or alias)
     pub name: Option<ImportName>,
     /// Import path string
     pub path: StringLit,
+    /// Trailing line comment group (optional)
+    pub comment: Option<CommentGroupId>,
 }
 
 /// Import name variants.
@@ -813,6 +826,8 @@ pub enum ImportName {
 /// Spec: `VarSpec = IdentifierList ( Type [ "=" ExpressionList ] | "=" ExpressionList )`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WalkAst)]
 pub struct ValueSpec {
+    /// Full span of this spec (value-stored; not arena-allocated).
+    pub span: Span,
     /// Leading doc comment group (optional)
     pub doc: Option<CommentGroupId>,
     /// Variable/constant names
@@ -821,6 +836,8 @@ pub struct ValueSpec {
     pub typ: Option<TypeId>,
     /// Initial values
     pub values: ListRef<ExprId>,
+    /// Trailing line comment group (optional)
+    pub comment: Option<CommentGroupId>,
 }
 
 /// Type specification.
@@ -829,6 +846,8 @@ pub struct ValueSpec {
 /// Type parameters represented as empty list when absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WalkAst)]
 pub struct TypeSpec {
+    /// Full span of this spec (value-stored; not arena-allocated).
+    pub span: Span,
     /// Leading doc comment group (optional)
     pub doc: Option<CommentGroupId>,
     /// Type name
@@ -843,6 +862,8 @@ pub struct TypeSpec {
     pub typ: TypeId,
     /// True if this is an alias (`=`), false if definition
     pub alias: bool,
+    /// Trailing line comment group (optional)
+    pub comment: Option<CommentGroupId>,
 }
 
 /// Function or method declaration.
@@ -900,7 +921,11 @@ pub enum TypeConstraint {
 /// Syntactic type element: `TypeTerm { "|" TypeTerm }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WalkAst)]
 pub struct TypeElem {
+    /// Full span of the entire union/type-element (value-stored).
+    pub span: Span,
     pub terms: ListRef<TypeTerm>,
+    /// Positions of '|' tokens. Invariant: pipes.len == max(terms.len-1, 0)
+    pub pipe_pos: ListRef<Span>,
 }
 
 /// Method receiver with optional receiver-declared type parameter names.
@@ -956,6 +981,8 @@ pub struct FieldList {
     pub l_paren: Span,
     /// Fields
     pub fields: ListRef<FieldId>,
+    /// Optional trailing comma before ')'
+    pub trailing_comma: Option<Span>,
     /// Closing parenthesis
     pub r_paren: Span,
 }
@@ -1166,10 +1193,24 @@ pub enum SwitchClause {
         stmts: ListRef<StmtId>,
     },
 
+    /// Expression default: `default:`
+    ExprDefault {
+        default_pos: Span,
+        colon_pos: Span,
+        stmts: ListRef<StmtId>,
+    },
+
     /// Type case: `case int, string:` or `default:`
     TypeCase {
         case_pos: Span,
         items: ListRef<TypeCaseElem>,
+        colon_pos: Span,
+        stmts: ListRef<StmtId>,
+    },
+
+    /// Type default: `default:`
+    TypeDefault {
+        default_pos: Span,
         colon_pos: Span,
         stmts: ListRef<StmtId>,
     },
@@ -1263,8 +1304,8 @@ pub enum TypeSwitchBind {
         ident_pos: Span,
         op_pos: Span,
     },
-    /// Assignment: `x =`
-    Assign { lhs: ListRef<ExprId>, op_pos: Span },
+    /// Error-recovery only: `x =` is NOT valid in a type-switch guard per spec.
+    BadAssign { lhs: ListRef<ExprId>, op_pos: Span },
 }
 
 // =============================================================================
@@ -1287,6 +1328,8 @@ pub struct LiteralValue {
 /// Spec: `KeyedElement = [ Key ":" ] Element`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WalkAst)]
 pub struct KeyedElement {
+    /// Full span of this keyed element (value-stored).
+    pub span: Span,
     pub key: Option<Key>,
     pub colon_pos: Option<Span>,
     pub value: Element,
@@ -1295,11 +1338,12 @@ pub struct KeyedElement {
 /// Key in a keyed element.
 ///
 /// Spec: `Key = FieldName | Expression | LiteralValue`
+///
+/// NOTE: We do NOT commit to FieldName at parse time because `T{a:1}` may be
+/// a map key expression or a struct field key depending on later semantic analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WalkAst)]
 pub enum Key {
-    /// Field name in struct literal: `Person{Name: "Alice"}`
-    FieldName { ident: Ident, ident_pos: Span },
-    /// Expression key: `map[string]int{"key": 1}`
+    /// Expression key (includes identifiers/selectors).
     Expr(ExprId),
     /// Nested literal: `[][]int{{1, 2}}`
     Literal(LiteralValue),
@@ -1573,7 +1617,7 @@ pub enum ChanDir {
 /// Type case element (in type switch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WalkAst)]
 pub enum TypeCaseElem {
-    Type(TypeId),
+    Type { span: Span, typ: TypeId },
     Nil(Span),
 }
 
@@ -1581,9 +1625,13 @@ pub enum TypeCaseElem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WalkAst)]
 pub enum TypeTerm {
     /// Approximate type: `~T`
-    Tilde { tilde_pos: Span, typ: TypeId },
+    Tilde {
+        span: Span,
+        tilde_pos: Span,
+        typ: TypeId,
+    },
     /// Exact type: `T`
-    Type { typ: TypeId },
+    Type { span: Span, typ: TypeId },
 }
 
 /// Interface element.
@@ -1591,13 +1639,18 @@ pub enum TypeTerm {
 pub enum InterfaceElem {
     /// Method specification: `Method(...) ...`
     Method {
+        span: Span,
         name: Ident,
         name_pos: Span,
         sig: SignatureId,
     },
 
     /// Type element: embedded type (`io.Reader`) or union (`int | ~float64`)
-    TypeElem(TypeElem),
+    TypeElem {
+        /// Full span of this element (value-stored).
+        span: Span,
+        elem: TypeElem,
+    },
 }
 
 // =============================================================================
