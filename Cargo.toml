@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/parser", "crates/ast_derive"]
+members = ["crates/parser", "crates/ast_derive", "fuzz"]
 resolver = "3"
 
 [workspace.dependencies]

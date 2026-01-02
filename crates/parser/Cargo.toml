@@ -14,11 +14,13 @@ bumpalo = "3.19.1"
 la-arena = "0.3.1"
 smol_str = "0.3.4"
 ast_derive = { path = "../ast_derive" }
+memchr = "2.7.6"
 
 [build-dependencies]
 lalrpop = "0.22"
 
 [dev-dependencies]
+proptest = "1"
 pretty_assertions = "1"
 walkdir = "2"
 criterion = { version = "0.8.1", features = ["html_reports"] }
