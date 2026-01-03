@@ -358,6 +358,12 @@ TypeParamDecl: ast::TypeParamDeclId = {
     )
 };
 
+// -----------------------------------------------------------------------------
+// FIX (chan): canonical + “leftmost chan”
+//  - ChanType está factorizado en un no-terminal (evita duplicación estructural)
+//  - `chan T` usa ElementTypeNoRecv (T no puede empezar con `<-` sin paréntesis)
+// -----------------------------------------------------------------------------
+
 TypeLit: ast::TypeId = {
     ArrayType,
     SliceType,
@@ -366,41 +372,101 @@ TypeLit: ast::TypeId = {
     FunctionType,
     InterfaceType,
     MapType,
+    ChanType,
+};
 
-    // chan T
-    "chan" <t:Type> => arena.types.alloc(
-        ast::Type::Chan {
-            dir: ast::ChanDir::Both,
-            chan_pos: Span::default(),
-            recv_arrow_pos: None,
-            send_arrow_pos: None,
-            elem: t
-        },
-        Span::default()
-    ),
-
-    // chan <- T
-    "chan" "<-" <t:Type> => arena.types.alloc(
-        ast::Type::Chan {
-            dir: ast::ChanDir::Send,
-            chan_pos: Span::default(),
-            recv_arrow_pos: None,
-            send_arrow_pos: Some(Span::default()),
-            elem: t
-        },
-        Span::default()
-    ),
-
-    // <- chan T
-    <as:@L> "<-" "chan" <t:Type> => arena.types.alloc(
+// `chan T` (bidir) NO permite T que empiece con `<-` directamente.
+// Para obtener `chan (<-chan int)` debes parentizar.
+ChanType: ast::TypeId = {
+    // <- chan T   (recv-only)
+    <as:@L> "<-" <cp:@L> "chan" <t:Type> <e:@R> => arena.types.alloc(
         ast::Type::Chan {
             dir: ast::ChanDir::Recv,
-            chan_pos: Span::default(),
+            chan_pos: Span::new(cp, cp + 4),
             recv_arrow_pos: Some(span2(as)),
             send_arrow_pos: None,
             elem: t
         },
-        Span::default()
+        Span::new(as, e)
+    ),
+
+    // chan <- T   (send-only)
+    <cp:@L> "chan" <ap:@L> "<-" <t:Type> <e:@R> => arena.types.alloc(
+        ast::Type::Chan {
+            dir: ast::ChanDir::Send,
+            chan_pos: Span::new(cp, cp + 4),
+            recv_arrow_pos: None,
+            send_arrow_pos: Some(span2(ap)),
+            elem: t
+        },
+        Span::new(cp, e)
+    ),
+
+    // chan T      (bidir)  --- T NO puede empezar con `<-`
+    <cp:@L> "chan" <t:ElementTypeNoRecv> <e:@R> => arena.types.alloc(
+        ast::Type::Chan {
+            dir: ast::ChanDir::Both,
+            chan_pos: Span::new(cp, cp + 4),
+            recv_arrow_pos: None,
+            send_arrow_pos: None,
+            elem: t
+        },
+        Span::new(cp, e)
+    )
+};
+
+// ElementType para `chan T` que excluye el prefijo `<-` salvo que esté parentizado.
+ElementTypeNoRecv: ast::TypeId = {
+    TypeNoRecv,
+    <s:@L> "(" <t:Type> ")" <e:@R> => arena.types.alloc(
+        ast::Type::Paren { l_paren: span1(s), typ: t, r_paren: span1(e - 1) },
+        Span::new(s, e)
+    ),
+};
+
+// “Type” sin el caso que empieza con `<-` (i.e., sin `<-chan T` directo).
+TypeNoRecv: ast::TypeId = {
+    NamedType,
+    TypeLitNoRecv,
+};
+
+// Igual que TypeLit, pero sin el caso `<- chan T` (recv-only).
+// Aquí sí permitimos `chan T` y `chan<- T`, pero `chan T` vuelve a usar ElementTypeNoRecv,
+// aplicando la misma regla recursivamente.
+TypeLitNoRecv: ast::TypeId = {
+    ArrayType,
+    SliceType,
+    StructType,
+    PointerType,
+    FunctionType,
+    InterfaceType,
+    MapType,
+    ChanTypeNoRecv,
+};
+
+ChanTypeNoRecv: ast::TypeId = {
+    // chan <- T   (send-only)
+    <cp:@L> "chan" <ap:@L> "<-" <t:Type> <e:@R> => arena.types.alloc(
+        ast::Type::Chan {
+            dir: ast::ChanDir::Send,
+            chan_pos: Span::new(cp, cp + 4),
+            recv_arrow_pos: None,
+            send_arrow_pos: Some(span2(ap)),
+            elem: t
+        },
+        Span::new(cp, e)
+    ),
+
+    // chan T      (bidir)  --- T NO puede empezar con `<-`
+    <cp:@L> "chan" <t:ElementTypeNoRecv> <e:@R> => arena.types.alloc(
+        ast::Type::Chan {
+            dir: ast::ChanDir::Both,
+            chan_pos: Span::new(cp, cp + 4),
+            recv_arrow_pos: None,
+            send_arrow_pos: None,
+            elem: t
+        },
+        Span::new(cp, e)
     )
 };
 
