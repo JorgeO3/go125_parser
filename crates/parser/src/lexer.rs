@@ -3,24 +3,10 @@ use logos::{Lexer as LogosLexer, Logos};
 use std::ops::Range;
 
 // =============================================================================
-// 0. Shared helpers (single source of truth; no duplicates)
+// Character Classification & Validation Utilities
 // =============================================================================
 
-#[inline(always)]
-const fn first_newline_offset(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if matches!(bytes[i], b'\n' | b'\r') {
-            return Some(i);
-        }
-        i += 1;
-    }
-
-    None
-}
-
+/// Check if value is in inclusive range [lo, hi]
 #[inline(always)]
 pub const fn in_u32_inclusive(x: u32, lo: u32, hi: u32) -> bool {
     x >= lo && x <= hi
@@ -31,6 +17,7 @@ pub const fn in_u8_inclusive(x: u8, lo: u8, hi: u8) -> bool {
     x >= lo && x <= hi
 }
 
+/// Convert ASCII uppercase to lowercase
 #[inline(always)]
 pub const fn lower_ascii(b: u8) -> u8 {
     if in_u8_inclusive(b, b'A', b'Z') {
@@ -45,28 +32,13 @@ pub const fn is_dec_digit(b: u8) -> bool {
     in_u8_inclusive(b, b'0', b'9')
 }
 
-// One canonical hex LUT for the whole lexer (used by escapes, runes, and number munch).
+/// Canonical hexadecimal lookup table for the entire lexer
+#[rustfmt::skip]
 pub const HEX_LUT: [u8; 256] = {
     let mut t = [0xFFu8; 256];
-
-    let mut i = b'0';
-    while i <= b'9' {
-        t[i as usize] = i - b'0';
-        i += 1;
-    }
-
-    let mut i = b'a';
-    while i <= b'f' {
-        t[i as usize] = (i - b'a') + 10;
-        i += 1;
-    }
-
-    let mut i = b'A';
-    while i <= b'F' {
-        t[i as usize] = (i - b'A') + 10;
-        i += 1;
-    }
-
+    let mut i = b'0'; while i <= b'9' { t[i as usize] = i - b'0'; i += 1; }
+    let mut i = b'a'; while i <= b'f' { t[i as usize] = (i - b'a') + 10; i += 1; }
+    let mut i = b'A'; while i <= b'F' { t[i as usize] = (i - b'A') + 10; i += 1; }
     t
 };
 
@@ -80,76 +52,108 @@ pub const fn hex_value(b: u8) -> u32 {
     HEX_LUT[b as usize] as u32
 }
 
+/// Validate Unicode scalar value (excludes surrogates)
 #[inline(always)]
 pub const fn is_valid_unicode_scalar(x: u32) -> bool {
     x <= 0x10_FFFF && !in_u32_inclusive(x, 0xD800, 0xDFFF)
 }
 
+/// Check if byte sequence is valid decimal digits with underscores
 #[inline(always)]
 const fn is_decimal_digits_with_underscores(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
-
     let mut prev_was_digit = is_dec_digit(bytes[0]);
     if !prev_was_digit {
         return false;
     }
-
     let mut i = 1;
     while i < bytes.len() {
         let b = bytes[i];
         let is_digit = is_dec_digit(b);
-
         if b == b'_' {
-            // El underscore debe estar precedido por un dígito y seguido por otro
             if !prev_was_digit || i + 1 >= bytes.len() || !is_dec_digit(bytes[i + 1]) {
                 return false;
             }
-            prev_was_digit = false; // El underscore no es un dígito
+            prev_was_digit = false;
         } else if is_digit {
             prev_was_digit = true;
         } else {
-            return false; // Carácter inválido
+            return false;
         }
-
         i += 1;
     }
-
-    // El último carácter debe ser un dígito
     prev_was_digit
 }
 
 // =============================================================================
-// 1. Block comment scanner (manual; fast)
+// Logos Extras (Lexer State)
 // =============================================================================
 
-#[inline]
-fn lex_block_comment(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
-    use memchr::memchr;
-    
-    let rem = lex.remainder().as_bytes();
-    let mut search_start = 0;
-    
-    while let Some(star_pos) = memchr(b'*', &rem[search_start..]) {
-        let abs_pos = search_start + star_pos;
-        
-        // Verificar si tenemos '*/' 
-        if rem.get(abs_pos + 1) == Some(&b'/') {
-            lex.bump(abs_pos + 2);
-            return Ok(());
+/// Extra state for Logos lexer callbacks
+#[derive(Clone, Copy, Debug)]
+struct LexExtras {
+    block_nl_off: u32, // Offset to newline in block comment (u32::MAX = none)
+    num_info: u8,      // Number classification: 0=invalid, 1=int, 2=float
+}
+
+impl Default for LexExtras {
+    fn default() -> Self {
+        Self {
+            block_nl_off: u32::MAX,
+            num_info: 0,
         }
-        
-        search_start = abs_pos + 1;
     }
-    
-    // No se encontró cierre
-    lex.bump(rem.len());
-    Err(LexErrorKind::UnterminatedComment)
 }
 
 // =============================================================================
-// 2. Interpreted string escape validation (Go rules) -> LexErrorKind
+// Block Comment Scanner
+// =============================================================================
+
+/// Scan block comment and cache newline position for semicolon insertion
+#[inline]
+fn lex_block_comment(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
+    use memchr::{memchr2, memmem};
+
+    let rem = lex.remainder().as_bytes();
+
+    if let Some(end_pos) = memmem::find(rem, b"*/") {
+        lex.extras.block_nl_off = match memchr2(b'\n', b'\r', &rem[..end_pos]) {
+            Some(nl) => (2 + nl) as u32, // +2 accounts for already-matched "/*"
+            None => u32::MAX,
+        };
+        lex.bump(end_pos + 2);
+        Ok(())
+    } else {
+        lex.extras.block_nl_off = u32::MAX;
+        lex.bump(rem.len());
+        Err(LexErrorKind::UnterminatedComment)
+    }
+}
+
+// =============================================================================
+// Raw String Scanner
+// =============================================================================
+
+/// Single-pass raw string scanner (backtick-delimited)
+#[inline]
+fn lex_raw_string(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
+    use memchr::memchr;
+
+    let rem = lex.remainder().as_bytes();
+
+    if let Some(pos) = memchr(b'`', rem) {
+        lex.bump(pos + 1);
+        Ok(())
+    } else {
+        lex.bump(rem.len());
+        Err(LexErrorKind::InvalidToken)
+    }
+}
+
+// =============================================================================
+// Interpreted String Escape Validation (Go Rules)
 // =============================================================================
 
 mod esc {
@@ -184,19 +188,19 @@ mod esc {
     enum EscCharClass {
         Other = 0,
         Backslash = 1,
-        Simple = 2, // a b f n r t v " '
+        Simple = 2,
         X = 3,
         U = 4,
         BigU = 5,
-        Oct = 6, // 0-7
-        Hex = 7, // 8-9 c d e A-F (a/b/f remapped in hex states)
+        Oct = 6,
+        Hex = 7,
     }
 
+    /// Character class lookup table for escape sequences
+    #[rustfmt::skip]
     const ESC_CLASS: [u8; 256] = {
         use EscCharClass as ECC;
-
         let mut t = [ECC::Other as u8; 256];
-
         t[b'\\' as usize] = ECC::Backslash as u8;
 
         // Simple escapes
@@ -238,16 +242,16 @@ mod esc {
         t[b'D' as usize] = ECC::Hex as u8;
         t[b'E' as usize] = ECC::Hex as u8;
         t[b'F' as usize] = ECC::Hex as u8;
-
         t
     };
 
+    /// DFA transition table for escape sequence validation
+    #[rustfmt::skip]
     const ESC_TRANS: [[u8; 8]; 18] = {
         use EscCharClass as ECC;
         use EscState as ES;
 
         let mut t = [[ES::Error as u8; 8]; 18];
-
         const fn set(t: &mut [[u8; 8]; 18], st: ES, cc: ECC, nx: ES) {
             t[st as usize][cc as usize] = nx as u8;
         }
@@ -318,123 +322,154 @@ mod esc {
             | (st >= EscState::Long1 as u8 && st <= EscState::Long8 as u8)
     }
 
+    #[inline(always)]
+    const fn utf8_width(b0: u8) -> usize {
+        if b0 < 0x80 {
+            1
+        } else if b0 < 0xE0 {
+            2
+        } else if b0 < 0xF0 {
+            3
+        } else {
+            4
+        }
+    }
+
+    /// Single-pass scan and validation for interpreted strings
     #[inline]
-    pub fn validate_escapes_interpreted_body(body: &[u8]) -> Result<(), LexErrorKind> {
+    pub fn lex_interpreted_string(
+        lex: &mut LogosLexer<'_, super::RawTok>,
+    ) -> Result<(), LexErrorKind> {
         use EscCharClass as ECC;
         use EscState as ES;
 
+        let rem = lex.remainder().as_bytes();
         let mut state = ES::Normal as u8;
         let mut acc_hex = 0u32;
         let mut acc_oct = 0u32;
+        let mut saw_bad_escape = false;
+        let mut i = 0usize;
 
-        for &byte in body {
+        while i < rem.len() {
+            let byte = rem[i];
+
+            // Check for closing quote (only valid in Normal state)
+            if byte == b'"' && state == ES::Normal as u8 {
+                lex.bump(i + 1);
+                return if saw_bad_escape {
+                    Err(LexErrorKind::InvalidEscape)
+                } else {
+                    Ok(())
+                };
+            }
+
+            // Newlines terminate the string (Go behavior)
+            if byte == b'\n' || byte == b'\r' {
+                lex.bump(i);
+                return Err(LexErrorKind::InvalidToken);
+            }
+
+            // Handle UTF-8 multi-byte sequences
+            if byte >= 0x80 {
+                if state != ES::Normal as u8 {
+                    saw_bad_escape = true;
+                    state = ES::Normal as u8;
+                }
+                i += utf8_width(byte);
+                continue;
+            }
+
+            // ASCII path: run DFA
             let mut cc = ESC_CLASS[byte as usize];
 
-            // In hex states, treat ANY hex digit as Hex class (including a/b/f).
+            // In hex states, treat any hex digit as Hex class
             if state_expects_hex(state) && is_hex_digit(byte) {
                 cc = ECC::Hex as u8;
             }
 
             let next = ESC_TRANS[state as usize][cc as usize];
+
             if next == ES::Error as u8 {
-                return Err(LexErrorKind::InvalidEscape);
+                saw_bad_escape = true;
+                state = ES::Normal as u8;
+                acc_hex = 0;
+                acc_oct = 0;
+                i += 1;
+                continue;
             }
 
+            // Accumulate hex values
             let is_hex_class = (cc == ECC::Hex as u8) | (cc == ECC::Oct as u8);
-            let is_oct_class = cc == ECC::Oct as u8;
-
-            // Hex accumulator: \x, \u, \U  (branchless-ish via bit ops)
             let in_hex = state_expects_hex(state);
             if in_hex & is_hex_class {
                 let hv = hex_value(byte);
                 let is_first = (state == ES::Hex1 as u8)
                     | (state == ES::Uni1 as u8)
                     | (state == ES::Long1 as u8);
-                acc_hex = (acc_hex * (!is_first as u32)) << 4 | hv;
+                acc_hex = ((acc_hex * (!is_first as u32)) << 4) | hv;
             }
 
-            // Oct accumulator: \OOO
+            // Accumulate octal values
+            let is_oct_class = cc == ECC::Oct as u8;
             let in_oct =
                 (state == ES::Escape as u8) | (state == ES::Oct2 as u8) | (state == ES::Oct3 as u8);
             if in_oct & is_oct_class {
                 let ov = (byte - b'0') as u32;
                 let is_first_oct = state == ES::Escape as u8;
-                acc_oct = acc_oct * ((!is_first_oct as u32) * 8) + ov;
+                acc_oct = acc_oct * (((!is_first_oct) as u32) * 8) + ov;
             }
 
-            // Validate on completion
+            // Validate completed escape sequences
             let completing_u4 = (state == ES::Uni4 as u8) & is_hex_class;
             let completing_u8 = (state == ES::Long8 as u8) & is_hex_class;
             let completing_o3 = (state == ES::Oct3 as u8) & is_oct_class;
 
             if completing_u4 | completing_u8 {
                 if !is_valid_unicode_scalar(acc_hex) {
-                    return Err(LexErrorKind::InvalidEscape);
+                    saw_bad_escape = true;
                 }
                 acc_hex = 0;
             }
 
             if completing_o3 {
                 if acc_oct > 255 {
-                    return Err(LexErrorKind::InvalidEscape);
+                    saw_bad_escape = true;
                 }
                 acc_oct = 0;
             }
 
-            // Reset after \xHH
-            let completing_x2 = (state == ES::Hex2 as u8) & is_hex_class;
-            if completing_x2 {
+            if (state == ES::Hex2 as u8) & is_hex_class {
                 acc_hex = 0;
             }
 
             state = next;
+            i += 1;
         }
 
-        if state != ES::Normal as u8 {
-            return Err(LexErrorKind::InvalidEscape);
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub fn validate_interpreted_string(
-        lex: &mut LogosLexer<'_, super::RawTok>,
-    ) -> Result<(), LexErrorKind> {
-        let s = lex.slice().as_bytes();
-
-        let is_invalid_string = s.len() < 2 || s[0] != b'"' || *s.last().unwrap() != b'"';
-        if is_invalid_string {
-            return Err(LexErrorKind::InvalidToken);
-        }
-
-        validate_escapes_interpreted_body(&s[1..s.len() - 1])
+        // EOF before closing quote
+        lex.bump(rem.len());
+        Err(LexErrorKind::InvalidToken)
     }
 }
 
 // =============================================================================
-// 3. Rune literal validation (UTF-8 + escapes) -> LexErrorKind
+// Rune Literal Validation (UTF-8 + Escapes)
 // =============================================================================
 
 mod rune {
     use super::*;
 
-    // 0 = invalid lead, 1..4 = length (reject overlong leads)
+    /// UTF-8 sequence length lookup table
+    #[rustfmt::skip]
     const UTF8_LEN: [u8; 256] = {
         let mut t = [0u8; 256];
         let mut i = 0usize;
         while i < 256 {
             let b = i as u8;
-            if b < 0x80 {
-                t[i] = 1;
-            } else if b >= 0xC2 && b <= 0xDF {
-                t[i] = 2;
-            } else if b >= 0xE0 && b <= 0xEF {
-                t[i] = 3;
-            } else if b >= 0xF0 && b <= 0xF4 {
-                t[i] = 4;
-            } else {
-                t[i] = 0;
-            }
+            if b < 0x80 { t[i] = 1; }
+            else if b >= 0xC2 && b <= 0xDF { t[i] = 2; }
+            else if b >= 0xE0 && b <= 0xEF { t[i] = 3; }
+            else if b >= 0xF0 && b <= 0xF4 { t[i] = 4; }
             i += 1;
         }
         t
@@ -442,42 +477,35 @@ mod rune {
 
     const UTF8_FIRST_MASK: [u8; 5] = [0, 0x7F, 0x1F, 0x0F, 0x07];
 
-    // Constrain b1 to prevent overlong / surrogates / >0x10FFFF.
+    /// Minimum valid second byte for UTF-8 sequences
+    #[rustfmt::skip]
     const UTF8_B1_MIN: [u8; 256] = {
         let mut t = [0u8; 256];
         let mut i = 0usize;
         while i < 256 {
             let b0 = i as u8;
             let len = UTF8_LEN[i];
-            t[i] = if len < 2 {
-                0
-            } else if b0 == 0xE0 {
-                0xA0
-            } else if b0 == 0xF0 {
-                0x90
-            } else {
-                0x80
-            };
+            t[i] = if len < 2 { 0 }
+                   else if b0 == 0xE0 { 0xA0 }
+                   else if b0 == 0xF0 { 0x90 }
+                   else { 0x80 };
             i += 1;
         }
         t
     };
 
+    /// Maximum valid second byte for UTF-8 sequences
+    #[rustfmt::skip]
     const UTF8_B1_MAX: [u8; 256] = {
         let mut t = [0u8; 256];
         let mut i = 0usize;
         while i < 256 {
             let b0 = i as u8;
             let len = UTF8_LEN[i];
-            t[i] = if len < 2 {
-                0
-            } else if b0 == 0xED {
-                0x9F
-            } else if b0 == 0xF4 {
-                0x8F
-            } else {
-                0xBF
-            };
+            t[i] = if len < 2 { 0 }
+                   else if b0 == 0xED { 0x9F }
+                   else if b0 == 0xF4 { 0x8F }
+                   else { 0xBF };
             i += 1;
         }
         t
@@ -488,9 +516,9 @@ mod rune {
         (b & 0xC0) == 0x80
     }
 
+    /// Decode one UTF-8 codepoint from byte slice
     #[inline]
     const fn decode_utf8_one(data: &[u8], start: usize) -> Result<(u32, usize), LexErrorKind> {
-        // Validación de bounds y longitud
         if start >= data.len() {
             return Err(LexErrorKind::InvalidToken);
         }
@@ -502,7 +530,6 @@ mod rune {
             return Err(LexErrorKind::InvalidToken);
         }
 
-        // Fast path: ASCII
         if len == 1 {
             return match first_byte {
                 b'\n' | b'\r' => Err(LexErrorKind::InvalidToken),
@@ -510,7 +537,6 @@ mod rune {
             };
         }
 
-        // Validar segundo byte (siempre presente en multibyte)
         let second_byte = data[start + 1];
         if !in_u8_inclusive(
             second_byte,
@@ -521,7 +547,6 @@ mod rune {
             return Err(LexErrorKind::InvalidToken);
         }
 
-        // Validar bytes de continuación restantes (si existen)
         let mut i = 2;
         while i < len {
             if !is_utf8_cont(data[start + i]) {
@@ -530,7 +555,6 @@ mod rune {
             i += 1;
         }
 
-        // Decodificar codepoint
         let mask = UTF8_FIRST_MASK[len];
         let mut codepoint = (first_byte & mask) as u32;
         i = 1;
@@ -539,7 +563,6 @@ mod rune {
             i += 1;
         }
 
-        // Validación final
         match is_valid_unicode_scalar(codepoint) {
             true => Ok((codepoint, len)),
             false => Err(LexErrorKind::InvalidToken),
@@ -549,13 +572,15 @@ mod rune {
     #[repr(u8)]
     enum RuneEscType {
         Invalid = 0,
-        Simple = 1,   // \n, \t, etc (incl \' \" \\)
-        Hex = 2,      // \xHH
-        Unicode4 = 3, // \uHHHH
-        Unicode8 = 4, // \UHHHHHHHH
-        Octal = 5,    // \OOO
+        Simple = 1,
+        Hex = 2,
+        Unicode4 = 3,
+        Unicode8 = 4,
+        Octal = 5,
     }
 
+    /// Escape type classification table
+    #[rustfmt::skip]
     const RUNE_ESC_TYPE: [u8; 256] = {
         let mut t = [RuneEscType::Invalid as u8; 256];
 
@@ -570,8 +595,6 @@ mod rune {
         t[b'\\' as usize] = RuneEscType::Simple as u8;
         // t[b'"' as usize] = RuneEscType::Simple as u8;
         t[b'\'' as usize] = RuneEscType::Simple as u8;
-
-        // Prefixes
         t[b'x' as usize] = RuneEscType::Hex as u8;
         t[b'u' as usize] = RuneEscType::Unicode4 as u8;
         t[b'U' as usize] = RuneEscType::Unicode8 as u8;
@@ -586,7 +609,6 @@ mod rune {
         t
     };
 
-    // bytes to consume starting at byte after '\', including that byte:
     const RUNE_ESC_CONSUME: [u8; 6] = [0, 1, 3, 5, 9, 3];
 
     #[inline(always)]
@@ -594,10 +616,12 @@ mod rune {
         b >= b'0' && b <= b'7'
     }
 
+    /// Validate escape sequence in rune literal
     #[inline]
     fn validate_escape(body: &[u8], start: usize) -> Result<usize, LexErrorKind> {
         let esc_ch = *body.get(start).ok_or(LexErrorKind::InvalidEscape)?;
         let ty = RUNE_ESC_TYPE[esc_ch as usize];
+
         if ty == RuneEscType::Invalid as u8 {
             return Err(LexErrorKind::InvalidEscape);
         }
@@ -641,11 +665,9 @@ mod rune {
             let o1 = body[start];
             let o2 = body[start + 1];
             let o3 = body[start + 2];
-
             if !is_octal_digit(o1) || !is_octal_digit(o2) || !is_octal_digit(o3) {
                 return Err(LexErrorKind::InvalidEscape);
             }
-
             let val = ((o1 - b'0') as u32) * 64 + ((o2 - b'0') as u32) * 8 + ((o3 - b'0') as u32);
             if val > 255 {
                 return Err(LexErrorKind::InvalidEscape);
@@ -655,69 +677,72 @@ mod rune {
         Ok(consume)
     }
 
+    /// Single-pass scan and validation for rune literals
     #[inline]
-    pub fn validate_rune_lit_logos(
-        lex: &mut LogosLexer<'_, super::RawTok>,
-    ) -> Result<(), LexErrorKind> {
-        let slice = lex.slice().as_bytes();
+    pub fn lex_rune_lit(lex: &mut LogosLexer<'_, super::RawTok>) -> Result<(), LexErrorKind> {
+        let rem = lex.remainder().as_bytes();
 
-        if slice.len() < 3 {
-            return Err(LexErrorKind::InvalidToken);
-        }
-        if slice.first().copied() != Some(b'\'') || slice.last().copied() != Some(b'\'') {
+        if rem.is_empty() || rem[0] == b'\n' || rem[0] == b'\r' {
             return Err(LexErrorKind::InvalidToken);
         }
 
-        let body = &slice[1..slice.len() - 1];
-        if body.is_empty() {
-            return Err(LexErrorKind::InvalidToken);
-        }
+        if rem[0] == b'\\' {
+            // Escape sequence
+            if rem.len() < 2 {
+                lex.bump(rem.len());
+                return Err(LexErrorKind::InvalidEscape);
+            }
 
-        let consumed = if body[0] == b'\\' {
-            1 + validate_escape(body, 1)?
+            let consumed = 1 + validate_escape(rem, 1)?;
+
+            if rem.get(consumed) == Some(&b'\'') {
+                lex.bump(consumed + 1);
+                Ok(())
+            } else {
+                lex.bump(rem.len());
+                Err(LexErrorKind::InvalidToken)
+            }
         } else {
-            let (_cp, n) = decode_utf8_one(body, 0)?;
-            n
-        };
+            // Single UTF-8 codepoint
+            let (_cp, n) = decode_utf8_one(rem, 0)?;
 
-        if consumed != body.len() {
-            return Err(LexErrorKind::InvalidToken);
+            if rem.get(n) == Some(&b'\'') {
+                lex.bump(n + 1);
+                Ok(())
+            } else {
+                lex.bump(rem.len());
+                Err(LexErrorKind::InvalidToken)
+            }
         }
-
-        Ok(())
     }
 }
 
 // =============================================================================
-// 4. Number scanning/validation (Go-style DFA) -> LexErrorKind
-//   - classify_number(): authoritative validation + int/float classification
-//   - lex_number(): MAXIMAL MUNCH (branchless-ish) using shared HEX_LUT
+// Number Scanning & Validation (Go-style DFA)
 // =============================================================================
 
 mod num {
     use super::*;
 
-    // =====================
-    // DFA (validation)
-    // =====================
     #[repr(u8)]
     #[derive(Clone, Copy)]
     enum NumCharClass {
         Other = 0,
-        Zero = 1, // '0'
-        One = 2,  // '1'
-        Oct = 3,  // '2'..'7'
-        Dec = 4,  // '8'..'9'
-        Dot = 5,  // '.'
-        Us = 6,   // '_'
-        E = 7,    // e/E
-        P = 8,    // p/P
-        X = 9,    // x/X
-        O = 10,   // o/O
-        B = 11,   // b/B
-        Hex = 12, // a,c,d,f (+ uppercase)
+        Zero = 1,
+        One = 2,
+        Oct = 3,
+        Dec = 4,
+        Dot = 5,
+        Us = 6,
+        E = 7,
+        P = 8,
+        X = 9,
+        O = 10,
+        B = 11,
+        Hex = 12,
         Sign = 13,
     }
+
     const NCLASS: usize = 14;
 
     #[repr(u8)]
@@ -765,14 +790,15 @@ mod num {
         DecExp = 32,
         DecExpUs = 33,
     }
+
     const NSTATE: usize = 34;
 
-    const NUM_CLASS: [u8; 256] = {
+    /// Character class lookup for number tokenization
+    static NUM_CLASS: [u8; 256] = {
         use NumCharClass as NCC;
 
         let mut t = [NCC::Other as u8; 256];
-
-        t[b'0' as usize] = NCC::Zero as u8;
+        t[b'0' as usize] = NCC::Zero as u8; 
         t[b'1' as usize] = NCC::One as u8;
 
         let mut i = b'2';
@@ -817,111 +843,111 @@ mod num {
         t
     };
 
+    /// DFA transition table for number validation
     static NUM_TRANS: [[u8; NCLASS]; NSTATE] = {
         let mut t = [[NumState::Err as u8; NCLASS]; NSTATE];
-
         macro_rules! tr {
-            ($st:expr, [$($c:expr),+ $(,)?] => $to:expr) => {{
+            ($st:expr, [$($c:expr),+ $(,)?] => $to:expr) => {
                 $( t[$st as u8 as usize][$c as u8 as usize] = $to as u8; )+
-            }};
+            };
         }
-
         use NumCharClass as NCC;
         use NumState as NS;
-
-        tr!(NS::Start, [NCC::Zero] => NS::Zero);
+        // Start state
+        tr!(NS::Start, [NCC::Zero] => NS::Zero); 
         tr!(NS::Start, [NCC::One, NCC::Oct, NCC::Dec] => NS::DecInt);
         tr!(NS::Start, [NCC::Dot] => NS::DotStart);
-
-        tr!(NS::Zero, [NCC::X] => NS::PreHex);
-        tr!(NS::Zero, [NCC::O] => NS::PreOct);
+        
+        // Zero state (prefix detection)
+        tr!(NS::Zero, [NCC::X] => NS::PreHex); 
+        tr!(NS::Zero, [NCC::O] => NS::PreOct); 
         tr!(NS::Zero, [NCC::B] => NS::PreBin);
-        tr!(NS::Zero, [NCC::Dot] => NS::DecDot);
+        tr!(NS::Zero, [NCC::Dot] => NS::DecDot); 
         tr!(NS::Zero, [NCC::E] => NS::DecExpStart);
-        tr!(NS::Zero, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct);
+        tr!(NS::Zero, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct); 
         tr!(NS::Zero, [NCC::Us] => NS::LegacyOctUs);
         tr!(NS::Zero, [NCC::Dec] => NS::BadLead);
-
-        tr!(NS::DecInt, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecInt);
+        
+        // Decimal integer
+        tr!(NS::DecInt, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecInt); 
         tr!(NS::DecInt, [NCC::Us] => NS::DecIntUs);
-        tr!(NS::DecInt, [NCC::Dot] => NS::DecDot);
+        tr!(NS::DecInt, [NCC::Dot] => NS::DecDot); 
         tr!(NS::DecInt, [NCC::E] => NS::DecExpStart);
         tr!(NS::DecIntUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecInt);
-
-        tr!(NS::LegacyOct, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct);
+        
+        // Legacy octal
+        tr!(NS::LegacyOct, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct); 
         tr!(NS::LegacyOct, [NCC::Us] => NS::LegacyOctUs);
-        tr!(NS::LegacyOct, [NCC::Dec] => NS::BadLead);
+        tr!(NS::LegacyOct, [NCC::Dec] => NS::BadLead); 
         tr!(NS::LegacyOct, [NCC::Dot] => NS::DecDot);
-        tr!(NS::LegacyOct, [NCC::E] => NS::DecExpStart);
+        tr!(NS::LegacyOct, [NCC::E] => NS::DecExpStart); 
         tr!(NS::LegacyOctUs, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct);
         tr!(NS::LegacyOctUs, [NCC::Dec] => NS::BadLead);
 
-        tr!(NS::BadLead, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::BadLead);
+        // Bad leading digit
+        tr!(NS::BadLead, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::BadLead); 
         tr!(NS::BadLead, [NCC::Us] => NS::BadLeadUs);
-        tr!(NS::BadLead, [NCC::Dot] => NS::DecDot);
+        tr!(NS::BadLead, [NCC::Dot] => NS::DecDot); 
         tr!(NS::BadLead, [NCC::E] => NS::DecExpStart);
         tr!(NS::BadLeadUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::BadLead);
-
+        
+        // Decimal float
         tr!(NS::DotStart, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac);
-
-        tr!(NS::DecDot, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac);
+        tr!(NS::DecDot, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac); 
         tr!(NS::DecDot, [NCC::E] => NS::DecExpStart);
-
-        tr!(NS::DecFrac, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac);
+        tr!(NS::DecFrac, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac); 
         tr!(NS::DecFrac, [NCC::Us] => NS::DecFracUs);
-        tr!(NS::DecFrac, [NCC::E] => NS::DecExpStart);
+        tr!(NS::DecFrac, [NCC::E] => NS::DecExpStart); 
         tr!(NS::DecFracUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac);
-
-        tr!(NS::DecExpStart, [NCC::Sign] => NS::DecExpSign);
+        
+        // Decimal exponent
+        tr!(NS::DecExpStart, [NCC::Sign] => NS::DecExpSign); 
         tr!(NS::DecExpStart, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp);
         tr!(NS::DecExpSign, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp);
-        tr!(NS::DecExp, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp);
+        tr!(NS::DecExp, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp); 
         tr!(NS::DecExp, [NCC::Us] => NS::DecExpUs);
         tr!(NS::DecExpUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp);
-
-        tr!(NS::PreHex, [NCC::Us] => NS::HexIntUs);
+        
+        // Hexadecimal
+        tr!(NS::PreHex, [NCC::Us] => NS::HexIntUs); 
         tr!(NS::PreHex, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexInt);
         tr!(NS::PreHex, [NCC::Dot] => NS::HexDotNoDig);
-
-        tr!(NS::HexInt, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexInt);
+        tr!(NS::HexInt, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexInt); 
         tr!(NS::HexInt, [NCC::Us] => NS::HexIntUs);
-        tr!(NS::HexInt, [NCC::Dot] => NS::HexDotHaveDig);
+        tr!(NS::HexInt, [NCC::Dot] => NS::HexDotHaveDig); 
         tr!(NS::HexInt, [NCC::P] => NS::HexExpStart);
         tr!(NS::HexIntUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexInt);
-
         tr!(NS::HexDotNoDig, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac);
-
         tr!(NS::HexDotHaveDig, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac);
         tr!(NS::HexDotHaveDig, [NCC::P] => NS::HexExpStart);
-
-        tr!(NS::HexFrac, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac);
+        tr!(NS::HexFrac, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac); 
         tr!(NS::HexFrac, [NCC::Us] => NS::HexFracUs);
-        tr!(NS::HexFrac, [NCC::P] => NS::HexExpStart);
+        tr!(NS::HexFrac, [NCC::P] => NS::HexExpStart); 
         tr!(NS::HexFracUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac);
 
-        tr!(NS::HexExpStart, [NCC::Sign] => NS::HexExpSign);
+        // Hex exponent
+        tr!(NS::HexExpStart, [NCC::Sign] => NS::HexExpSign); 
         tr!(NS::HexExpStart, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp);
         tr!(NS::HexExpSign, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp);
-        tr!(NS::HexExp, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp);
+        tr!(NS::HexExp, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp); 
         tr!(NS::HexExp, [NCC::Us] => NS::HexExpUs);
         tr!(NS::HexExpUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp);
 
-        tr!(NS::PreOct, [NCC::Us] => NS::OctIntUs);
+        // Octal (0o prefix)
+        tr!(NS::PreOct, [NCC::Us] => NS::OctIntUs); 
         tr!(NS::PreOct, [NCC::Zero, NCC::One, NCC::Oct] => NS::OctInt);
-        tr!(NS::OctInt, [NCC::Zero, NCC::One, NCC::Oct] => NS::OctInt);
+        tr!(NS::OctInt, [NCC::Zero, NCC::One, NCC::Oct] => NS::OctInt); 
         tr!(NS::OctInt, [NCC::Us] => NS::OctIntUs);
         tr!(NS::OctIntUs, [NCC::Zero, NCC::One, NCC::Oct] => NS::OctInt);
-
-        tr!(NS::PreBin, [NCC::Us] => NS::BinIntUs);
-        tr!(NS::PreBin, [NCC::Zero, NCC::One] => NS::BinInt);
-        tr!(NS::BinInt, [NCC::Zero, NCC::One] => NS::BinInt);
-        tr!(NS::BinInt, [NCC::Us] => NS::BinIntUs);
+        
+        // Binary
+        tr!(NS::PreBin, [NCC::Us] => NS::BinIntUs); tr!(NS::PreBin, [NCC::Zero, NCC::One] => NS::BinInt);
+        tr!(NS::BinInt, [NCC::Zero, NCC::One] => NS::BinInt); tr!(NS::BinInt, [NCC::Us] => NS::BinIntUs);
         tr!(NS::BinIntUs, [NCC::Zero, NCC::One] => NS::BinInt);
-
         t
     };
 
-    // bit0: accept, bit1: is_float
+    /// State properties: bit0=accept, bit1=is_float
     static STATE_PROPS: [u8; NSTATE] = {
         let mut t = [0u8; NSTATE];
 
@@ -942,47 +968,12 @@ mod num {
         t
     };
 
-    #[inline]
-    pub const fn classify_number(lit: &[u8]) -> Result<bool, LexErrorKind> {
-        if lit.is_empty() {
-            return Err(LexErrorKind::InvalidNumber);
-        }
-
-        let final_state = {
-            let mut state = NumState::Start as u8;
-            let mut i = 0;
-
-            while i < lit.len() {
-                let char_class = NUM_CLASS[lit[i] as usize] as usize;
-                state = NUM_TRANS[state as usize][char_class];
-
-                if state == NumState::Err as u8 {
-                    return Err(LexErrorKind::InvalidNumber);
-                }
-                i += 1;
-            }
-            state
-        };
-
-        let props = STATE_PROPS[final_state as usize];
-
-        match props & 1 {
-            0 => Err(LexErrorKind::InvalidNumber),
-            _ => Ok((props & 2) != 0),
-        }
-    }
-
-    // =====================
-    // Branchless-ish maximal munch
-    // =====================
-
     #[inline(always)]
     const fn lower_ascii_branchless(b: u8) -> u8 {
         b | 0x20
     }
 
-    // NOTE: For maximal munch we MUST NOT restrict digit ranges for base 2/8,
-    // otherwise "0b2" becomes "0b" + "2" (WRONG boundary). Validation is DFA’s job.
+    /// Consume consecutive digits (decimal or hex based on base parameter)
     #[inline]
     const fn consume_digits(src: &[u8], mut i: usize, n: usize, base: u8) -> usize {
         if base == 16 {
@@ -1007,27 +998,44 @@ mod num {
         i
     }
 
-    /// Logos callback: extend number token to maximal munch (branchless-ish).
-    /// Equivalent boundaries to the previous “simple” lexer:
-    /// - 0b2, 09, 0o9 stay as a single token and are rejected later by classify_number().
+    /// Maximal munch number scanner with integrated DFA classification
+    /// Stores classification result in `lex.extras.num_info`: 0=invalid, 1=int, 2=float
     #[inline]
     pub fn lex_number(lex: &mut LogosLexer<'_, super::RawTok>) -> Result<(), LexErrorKind> {
+        lex.extras.num_info = 0;
+
         let src = lex.source().as_bytes();
         let start = lex.span().start;
         let n = src.len();
+
         if start >= n {
             return Ok(());
         }
 
         let mut i = start;
         let mut base: u8 = 10;
+        let mut state = NumState::Start as u8;
+        let mut invalid = false;
 
-        // integer part / leading '.'
+        #[inline(always)]
+        const fn step(state: &mut u8, invalid: &mut bool, b: u8) {
+            if *invalid {
+                return;
+            }
+            let cc = NUM_CLASS[b as usize] as usize;
+            let nx = NUM_TRANS[*state as usize][cc];
+            *state = nx;
+            if nx == NumState::Err as u8 {
+                *invalid = true;
+            }
+        }
+
+        // Handle integer part or leading dot
         if src[i] != b'.' {
             let first = src[i];
             i += 1;
+            step(&mut state, &mut invalid, first);
 
-            // leading '0' path (legacy => base 8, unless 0x/0o/0b prefix)
             if first == b'0' {
                 base = 8;
                 if i < n {
@@ -1036,175 +1044,206 @@ mod num {
                     let is_o = (nl == b'o') as u8;
                     let is_b = (nl == b'b') as u8;
                     let has_prefix = is_x | is_o | is_b;
-
-                    // base: 16 if x, 2 if b, else 8 (o and no-prefix both map to 8)
-                    // 8 + 8*is_x - 6*is_b => { none/o:8, x:16, b:2 }
                     base = (8u8 + (8u8 * is_x)).wrapping_sub(6u8 * is_b);
-
-                    // consume prefix if present
-                    i += has_prefix as usize;
+                    if has_prefix != 0 {
+                        let p = src[i];
+                        i += 1;
+                        step(&mut state, &mut invalid, p);
+                    }
                 }
             }
 
+            let mut j = i;
             i = consume_digits(src, i, n, base);
+            while j < i {
+                step(&mut state, &mut invalid, src[j]);
+                j += 1;
+            }
         } else {
-            // ".<digit>" (regex guarantees at least one digit)
+            let dot = src[i];
             i += 1;
+            step(&mut state, &mut invalid, dot);
             base = 10;
-            i = consume_digits(src, i, n, base);
-        }
 
-        // fraction
-        if i < n && src[i] == b'.' {
-            // don't steal ".." / "..."
-            let is_range = (i + 1 < n && src[i + 1] == b'.') as u8;
-            if is_range == 0 {
-                i += 1;
-                i = consume_digits(src, i, n, base);
+            let mut j = i;
+            i = consume_digits(src, i, n, base);
+            while j < i {
+                step(&mut state, &mut invalid, src[j]);
+                j += 1;
             }
         }
 
-        // exponent (scanner is permissive; DFA validates e vs p requirements)
+        // Handle fractional part
+        if i < n && src[i] == b'.' {
+            let is_range = (i + 1 < n && src[i + 1] == b'.') as u8;
+            if is_range == 0 {
+                let dot = src[i];
+                i += 1;
+                step(&mut state, &mut invalid, dot);
+
+                let mut j = i;
+                i = consume_digits(src, i, n, base);
+                while j < i {
+                    step(&mut state, &mut invalid, src[j]);
+                    j += 1;
+                }
+            }
+        }
+
+        // Handle exponent
         if i < n {
             let e = lower_ascii_branchless(src[i]);
             let is_exp = ((e == b'e') | (e == b'p')) as u8;
             if is_exp != 0 {
+                let eb = src[i];
                 i += 1;
+                step(&mut state, &mut invalid, eb);
 
-                // optional sign
                 if i < n {
                     let s = src[i];
                     let is_sign = ((s == b'+') | (s == b'-')) as u8;
-                    i += is_sign as usize;
+                    if is_sign != 0 {
+                        i += 1;
+                        step(&mut state, &mut invalid, s);
+                    }
                 }
 
-                // exponent digits are always decimal + '_'
+                let mut j = i;
                 i = consume_digits(src, i, n, 10);
+                while j < i {
+                    step(&mut state, &mut invalid, src[j]);
+                    j += 1;
+                }
             }
         }
 
+        // Extend token span to match consumed bytes
         let already = lex.span().end;
         if i > already {
             lex.bump(i - already);
         }
+
+        // Classify based on final state
+        if !invalid {
+            let props = STATE_PROPS[state as usize];
+            if (props & 1) != 0 {
+                lex.extras.num_info = if (props & 2) != 0 { 2 } else { 1 };
+            }
+        }
+
         Ok(())
     }
 }
 
 // =============================================================================
-// 5. Token Definition (RawTok - DFA optimized for logos)
+// Raw Token Definition (Logos Integration)
 // =============================================================================
 
 #[repr(u8)]
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq)]
 #[logos(error = LexErrorKind)]
+#[logos(extras = LexExtras)]
 #[logos(skip r"[ \t]+")]
 #[rustfmt::skip]
 enum RawTok {
     #[token("\u{FEFF}")] Bom,
-
     // Trivia
     #[regex(r"\r\n|\n|\r")] Newline,
     #[regex(r"//[^\n\r]*", logos::skip, allow_greedy = true)] _LineComment,
-    #[token("/*", lex_block_comment)]
-    BlockComment,
-
-    // Keywords (before Ident)
-    #[token("break")] KwBreak,
-    #[token("case")] KwCase,
+    #[token("/*", lex_block_comment)] BlockComment,
+    
+    // Keywords
+    #[token("break")] KwBreak, 
+    #[token("case")] KwCase, 
     #[token("chan")] KwChan,
-    #[token("const")] KwConst,
-    #[token("continue")] KwContinue,
+    #[token("const")] KwConst, 
+    #[token("continue")] KwContinue, 
     #[token("default")] KwDefault,
-    #[token("defer")] KwDefer,
-    #[token("else")] KwElse,
+    #[token("defer")] KwDefer, 
+    #[token("else")] KwElse, 
     #[token("fallthrough")] KwFallthrough,
-    #[token("for")] KwFor,
-    #[token("func")] KwFunc,
+    #[token("for")] KwFor, 
+    #[token("func")] KwFunc, 
     #[token("go")] KwGo,
-    #[token("goto")] KwGoto,
-    #[token("if")] KwIf,
+    #[token("goto")] KwGoto, 
+    #[token("if")] KwIf, 
     #[token("import")] KwImport,
-    #[token("interface")] KwInterface,
-    #[token("map")] KwMap,
+    #[token("interface")] KwInterface, 
+    #[token("map")] KwMap, 
     #[token("package")] KwPackage,
-    #[token("range")] KwRange,
-    #[token("return")] KwReturn,
+    #[token("range")] KwRange, 
+    #[token("return")] KwReturn, 
     #[token("select")] KwSelect,
-    #[token("struct")] KwStruct,
-    #[token("switch")] KwSwitch,
+    #[token("struct")] KwStruct, 
+    #[token("switch")] KwSwitch, 
     #[token("type")] KwType,
     #[token("var")] KwVar,
-
-    // Identifiers
+    
+    // Identifiers & Literals
     #[regex(r"[_\p{L}][_\p{L}\p{Nd}]*")] Ident,
-
-    // Numbers (maximal munch in callback)
     #[regex(r"[0-9]|\.[0-9]", num::lex_number)] Number,
-
-    // Strings / runes
-    #[regex(r"`[^`]*`")] RawString,
-    #[regex(r#""([^"\\\n\r]|\\.)*""#, esc::validate_interpreted_string)] String,
-    #[regex(r"'([^'\\\n\r]|\\.)+'", rune::validate_rune_lit_logos)] Rune,
-
+    #[token("`", lex_raw_string)] RawString,
+    #[token("\"", esc::lex_interpreted_string)] String,
+    #[token("'", rune::lex_rune_lit)] Rune,
+    
     // Operators
     #[token("...")] Ellipsis,
-    #[token("<<=")] ShlAssign,
-    #[token(">>=")] ShrAssign,
+    #[token("<<=")] ShlAssign, 
+    #[token(">>=")] ShrAssign, 
     #[token("&^=")] AndNotAssign,
-    #[token("+=")] AddAssign,
-    #[token("-=")] SubAssign,
+    #[token("+=")] AddAssign, 
+    #[token("-=")] SubAssign, 
     #[token("*=")] MulAssign,
-    #[token("/=")] DivAssign,
-    #[token("%=")] ModAssign,
+    #[token("/=")] DivAssign, 
+    #[token("%=")] ModAssign, 
     #[token("&=")] AndAssign,
-    #[token("|=")] OrAssign,
+    #[token("|=")] OrAssign, 
     #[token("^=")] XorAssign,
-    #[token("<<")] Shl,
-    #[token(">>")] Shr,
+    #[token("<<")] Shl, 
+    #[token(">>")] Shr, 
     #[token("&^")] AndNot,
-    #[token("&&")] LAnd,
+    #[token("&&")] LAnd, 
     #[token("||")] LOr,
-    #[token("==")] EqEq,
-    #[token("!=")] NotEq,
-    #[token("<=")] Le,
+    #[token("==")] EqEq, 
+    #[token("!=")] NotEq, 
+    #[token("<=")] Le, 
     #[token(">=")] Ge,
-    #[token("++")] Inc,
-    #[token("--")] Dec,
-    #[token(":=")] Define,
+    #[token("++")] Inc, 
+    #[token("--")] Dec, 
+    #[token(":=")] Define, 
     #[token("<-")] Arrow,
-    #[token("=")] Assign,
-    #[token("+")] Plus,
-    #[token("-")] Minus,
+    #[token("=")] Assign, 
+    #[token("+")] Plus, 
+    #[token("-")] Minus, 
     #[token("*")] Star,
-    #[token("/")] Slash,
-    #[token("%")] Percent,
-    #[token("&")] Amp,
+    #[token("/")] Slash, 
+    #[token("%")] Percent, 
+    #[token("&")] Amp, 
     #[token("|")] Pipe,
-    #[token("^")] Caret,
-    #[token("~")] Tilde,
+    #[token("^")] Caret, 
+    #[token("~")] Tilde, 
     #[token("!")] Bang,
-    #[token("<")] Lt,
+    #[token("<")] Lt, 
     #[token(">")] Gt,
-
+    
     // Delimiters
-    #[token("(")] LParen,
-    #[token(")")] RParen,
-    #[token("[")] LBrack,
+    #[token("(")] LParen, 
+    #[token(")")] RParen, 
+    #[token("[")] LBrack, 
     #[token("]")] RBrack,
-    #[token("{")] LBrace,
+    #[token("{")] LBrace, 
     #[token("}")] RBrace,
-    #[token(",")] Comma,
-    #[token(";")] Semi,
-    #[token(":")] Colon,
+    #[token(",")] Comma, 
+    #[token(";")] Semi, 
+    #[token(":")] Colon, 
     #[token(".")] Dot,
-
-    // Catch-all (lowest priority)
+    
+    // Catch-all
     #[regex(r".", priority = 0)] Error,
 }
 
 // =============================================================================
-// 6. Lookup tables (fast classification)
+// Token Classification Lookup Tables
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1227,34 +1266,39 @@ macro_rules! gen_lookup_table {
     }};
 }
 
-const SEMI_INSERT_TABLE: [bool; 256] = gen_lookup_table!(
-    bool,
-    256,
-    Ident,
-    Number,
-    Rune,
-    String,
+const RAWTOK_COUNT: usize = RawTok::Error as usize + 1;
+
+/// Tokens that trigger automatic semicolon insertion (Go spec rule)
+#[rustfmt::skip]
+const SEMI_INSERT_TABLE: [bool; RAWTOK_COUNT] = gen_lookup_table!(
+    bool, 
+    RAWTOK_COUNT,
+    Ident, 
+    Number, 
+    Rune, 
+    String, 
     RawString,
-    KwBreak,
-    KwContinue,
-    KwFallthrough,
+    KwBreak, 
+    KwContinue, 
+    KwFallthrough, 
     KwReturn,
-    Inc,
-    Dec,
-    RParen,
-    RBrack,
+    Inc, 
+    Dec, 
+    RParen, 
+    RBrack, 
     RBrace,
 );
 
-const TOKEN_KIND_TABLE: [TokKind; 256] = gen_lookup_table!(
-    TokKind, 256, TokKind::Simple,
-    Newline => TokKind::Trivia,
-    _LineComment => TokKind::Trivia,
+const TOKEN_KIND_TABLE: [TokKind; RAWTOK_COUNT] = gen_lookup_table!(
+    TokKind, RAWTOK_COUNT, 
+    TokKind::Simple,
+    Newline => TokKind::Trivia, 
+    _LineComment => TokKind::Trivia, 
     BlockComment => TokKind::Trivia,
-    Ident => TokKind::Literal,
-    Number => TokKind::Literal,
+    Ident => TokKind::Literal, 
+    Number => TokKind::Literal, 
     Rune => TokKind::Literal,
-    String => TokKind::Literal,
+    String => TokKind::Literal, 
     RawString => TokKind::Literal,
 );
 
@@ -1269,9 +1313,10 @@ impl RawTok {
         TOKEN_KIND_TABLE[self as usize]
     }
 
+    /// Convert raw token to public token representation
     #[inline]
+    #[rustfmt::skip]
     const fn to_token<'src>(self, slice: &'src str) -> Tok<'src> {
-        // NOTE: Number is handled in wrapper (needs classify + imag lookahead)
         if matches!(self.kind(), TokKind::Literal) {
             return match self {
                 Self::Ident => Tok::Ident(slice),
@@ -1291,123 +1336,46 @@ impl RawTok {
                 }
             };
         }
-
+        
         simple_tok! {
             KwBreak => KwBreak, KwCase => KwCase, KwChan => KwChan, KwConst => KwConst,
             KwContinue => KwContinue, KwDefault => KwDefault, KwDefer => KwDefer, KwElse => KwElse,
             KwFallthrough => KwFallthrough, KwFor => KwFor, KwFunc => KwFunc, KwGo => KwGo,
             KwGoto => KwGoto, KwIf => KwIf, KwImport => KwImport, KwInterface => KwInterface,
             KwMap => KwMap, KwPackage => KwPackage, KwRange => KwRange, KwReturn => KwReturn,
-            KwSelect => KwSelect, KwStruct => KwStruct, KwSwitch => KwSwitch, KwType => KwType, KwVar => KwVar,
-
-            Ellipsis => Ellipsis, ShlAssign => ShlAssign, ShrAssign => ShrAssign, AndNotAssign => AndNotAssign,
-            AddAssign => AddAssign, SubAssign => SubAssign, MulAssign => MulAssign, DivAssign => DivAssign,
-            ModAssign => ModAssign, AndAssign => AndAssign, OrAssign => OrAssign, XorAssign => XorAssign,
-            Shl => Shl, Shr => Shr, AndNot => AndNot, LAnd => LAnd, LOr => LOr, EqEq => EqEq, NotEq => NotEq,
-            Le => Le, Ge => Ge, Inc => Inc, Dec => Dec, Define => Define, Arrow => Arrow,
-            Assign => Assign, Plus => Plus, Minus => Minus, Star => Star, Slash => Slash, Percent => Percent,
-            Amp => Amp, Pipe => Pipe, Caret => Caret, Tilde => Tilde, Bang => Bang, Lt => Lt, Gt => Gt,
-
-            LParen => LParen, RParen => RParen, LBrack => LBrack, RBrack => RBrack, LBrace => LBrace,
-            RBrace => RBrace, Comma => Comma, Semi => Semi, Colon => Colon, Dot => Dot, Error => Error,
-
-            Bom => Error, // wrapper enforces BOM placement
+            KwSelect => KwSelect, KwStruct => KwStruct, KwSwitch => KwSwitch, KwType => KwType,
+            KwVar => KwVar, Ellipsis => Ellipsis, ShlAssign => ShlAssign, ShrAssign => ShrAssign,
+            AndNotAssign => AndNotAssign, AddAssign => AddAssign, SubAssign => SubAssign,
+            MulAssign => MulAssign, DivAssign => DivAssign, ModAssign => ModAssign,
+            AndAssign => AndAssign, OrAssign => OrAssign, XorAssign => XorAssign,
+            Shl => Shl, Shr => Shr, AndNot => AndNot, LAnd => LAnd, LOr => LOr,
+            EqEq => EqEq, NotEq => NotEq, Le => Le, Ge => Ge, Inc => Inc, Dec => Dec,
+            Define => Define, Arrow => Arrow, Assign => Assign, Plus => Plus, Minus => Minus,
+            Star => Star, Slash => Slash, Percent => Percent, Amp => Amp, Pipe => Pipe,
+            Caret => Caret, Tilde => Tilde, Bang => Bang, Lt => Lt, Gt => Gt,
+            LParen => LParen, RParen => RParen, LBrack => LBrack, RBrack => RBrack,
+            LBrace => LBrace, RBrace => RBrace, Comma => Comma, Semi => Semi,
+            Colon => Colon, Dot => Dot, Error => Error, Bom => Error,
         }
     }
 }
 
 // =============================================================================
-// 7. Public Token Definition (zero-copy)
+// Public Token Definition (Zero-Copy)
 // =============================================================================
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok<'input> {
-    Ident(&'input str),
-    IntLit(&'input str),
-    FloatLit(&'input str),
-    ImagLit(&'input str),
-    RuneLit(&'input str),
-    StringLit(&'input str),
-    RawStringLit(&'input str),
-
-    // Keywords
-    KwBreak,
-    KwCase,
-    KwChan,
-    KwConst,
-    KwContinue,
-    KwDefault,
-    KwDefer,
-    KwElse,
-    KwFallthrough,
-    KwFor,
-    KwFunc,
-    KwGo,
-    KwGoto,
-    KwIf,
-    KwImport,
-    KwInterface,
-    KwMap,
-    KwPackage,
-    KwRange,
-    KwReturn,
-    KwSelect,
-    KwStruct,
-    KwSwitch,
-    KwType,
-    KwVar,
-
-    // Operators / Delimiters
-    Ellipsis,
-    ShlAssign,
-    ShrAssign,
-    AndNotAssign,
-    AddAssign,
-    SubAssign,
-    MulAssign,
-    DivAssign,
-    ModAssign,
-    AndAssign,
-    OrAssign,
-    XorAssign,
-    Shl,
-    Shr,
-    AndNot,
-    LAnd,
-    LOr,
-    EqEq,
-    NotEq,
-    Le,
-    Ge,
-    Inc,
-    Dec,
-    Define,
-    Arrow,
-    Assign,
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Percent,
-    Amp,
-    Pipe,
-    Caret,
-    Tilde,
-    Bang,
-    Lt,
-    Gt,
-    LParen,
-    RParen,
-    LBrack,
-    RBrack,
-    LBrace,
-    RBrace,
-    Comma,
-    Semi,
-    Colon,
-    Dot,
-
-    Error,
+    Ident(&'input str), IntLit(&'input str), FloatLit(&'input str), ImagLit(&'input str),
+    RuneLit(&'input str), StringLit(&'input str), RawStringLit(&'input str),
+    KwBreak, KwCase, KwChan, KwConst, KwContinue, KwDefault, KwDefer, KwElse,
+    KwFallthrough, KwFor, KwFunc, KwGo, KwGoto, KwIf, KwImport, KwInterface,
+    KwMap, KwPackage, KwRange, KwReturn, KwSelect, KwStruct, KwSwitch, KwType, KwVar,
+    Ellipsis, ShlAssign, ShrAssign, AndNotAssign, AddAssign, SubAssign, MulAssign,
+    DivAssign, ModAssign, AndAssign, OrAssign, XorAssign, Shl, Shr, AndNot,
+    LAnd, LOr, EqEq, NotEq, Le, Ge, Inc, Dec, Define, Arrow, Assign, Plus, Minus,
+    Star, Slash, Percent, Amp, Pipe, Caret, Tilde, Bang, Lt, Gt,
+    LParen, RParen, LBrack, RBrack, LBrace, RBrace, Comma, Semi, Colon, Dot, Error,
 }
 
 impl<'input> std::fmt::Display for Tok<'input> {
@@ -1417,12 +1385,13 @@ impl<'input> std::fmt::Display for Tok<'input> {
 }
 
 // =============================================================================
-// 8. Lexer wrapper: semicolon insertion + imag lookahead + diags
+// Lexer Wrapper (Semicolon Insertion + Diagnostics)
 // =============================================================================
 
+/// High-level lexer with automatic semicolon insertion and diagnostic collection
 pub struct Lexer<'src> {
     logos: LogosLexer<'src, RawTok>,
-    pending: Option<(usize, Tok<'src>, usize)>,
+    pending_semi_at: usize, // Position of pending injected semicolon (usize::MAX = none)
     diags: Vec<Diag>,
     last_can_insert_semi: bool,
     src_len: usize,
@@ -1433,7 +1402,7 @@ impl<'src> Lexer<'src> {
     pub fn new(input: &'src str) -> Self {
         Self {
             logos: RawTok::lexer(input),
-            pending: None,
+            pending_semi_at: usize::MAX,
             diags: Vec::with_capacity(16),
             last_can_insert_semi: false,
             src_len: input.len(),
@@ -1453,29 +1422,145 @@ impl<'src> Lexer<'src> {
 
     #[inline]
     fn emit_semi_at(&mut self, pos: usize) {
-        self.pending = Some((pos, Tok::Semi, pos));
+        self.pending_semi_at = pos;
     }
 
+    /// Handle trivia tokens and trigger semicolon insertion if needed
     #[inline]
-    fn handle_trivia(&mut self, raw: RawTok, span: &Range<usize>, slice: &str) -> bool {
+    fn handle_trivia(&mut self, raw: RawTok, start: usize) -> bool {
         match raw {
             RawTok::Newline => {
                 if self.last_can_insert_semi {
                     self.last_can_insert_semi = false;
-                    self.emit_semi_at(span.start);
+                    self.emit_semi_at(start);
                 }
                 true
             }
             RawTok::BlockComment => {
                 if self.last_can_insert_semi {
-                    if let Some(off) = first_newline_offset(slice) {
+                    let off = self.logos.extras.block_nl_off;
+                    if off != u32::MAX {
                         self.last_can_insert_semi = false;
-                        self.emit_semi_at(span.start + off);
+                        self.emit_semi_at(start + off as usize);
                     }
                 }
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Handle EOF and inject final semicolon if needed
+    #[inline]
+    fn handle_eof(&mut self) {
+        self.eof_done = true;
+        if self.last_can_insert_semi {
+            self.last_can_insert_semi = false;
+            self.emit_semi_at(self.src_len);
+        }
+    }
+
+    /// Handle lexer errors and emit diagnostics
+    #[inline]
+    fn handle_lex_error(&mut self, kind: LexErrorKind) -> (usize, Tok<'src>, usize) {
+        let span = self.logos.span();
+        let start = span.start;
+        let end = span.end;
+        self.push_lex_diag(kind, start..end);
+        self.last_can_insert_semi = false;
+        (start, Tok::Error, end)
+    }
+
+    /// Process raw token and convert to public token
+    #[inline]
+    fn handle_raw_token(&mut self, raw: RawTok) -> Option<(usize, Tok<'src>, usize)> {
+        let span = self.logos.span();
+        let start = span.start;
+        let end = span.end;
+        let slice = self.logos.slice();
+
+        // BOM is only valid at file start
+        if raw == RawTok::Bom {
+            if start == 0 {
+                return None;
+            }
+            self.push_lex_diag(LexErrorKind::InvalidToken, start..end);
+            self.last_can_insert_semi = false;
+            return Some((start, Tok::Error, end));
+        }
+
+        // Trivia handling
+        if self.handle_trivia(raw, start) {
+            return None;
+        }
+
+        // Generic error token
+        if raw == RawTok::Error {
+            self.push_lex_diag(LexErrorKind::InvalidToken, start..end);
+            self.last_can_insert_semi = false;
+            return Some((start, Tok::Error, end));
+        }
+
+        // Number token (requires special handling for imaginary suffix)
+        if raw == RawTok::Number {
+            return Some(self.handle_number_token(start, end, slice));
+        }
+
+        // Regular token
+        self.last_can_insert_semi = raw.can_insert_semicolon();
+        let tok = raw.to_token(slice);
+        Some((start, tok, end))
+    }
+
+    /// Handle number tokens with imaginary suffix lookahead
+    #[inline]
+    fn handle_number_token(
+        &mut self,
+        start: usize,
+        end: usize,
+        slice: &'src str,
+    ) -> (usize, Tok<'src>, usize) {
+        let src = self.logos.source();
+        let bytes = slice.as_bytes();
+        let has_i_suffix = end < self.src_len && src.as_bytes()[end] == b'i';
+        let info = self.logos.extras.num_info; // 0=invalid, 1=int, 2=float
+
+        if has_i_suffix {
+            let end_with_i = end + 1;
+            // Imaginary literal is valid if number part is valid OR is decimal_digits
+            let is_valid = info != 0 || is_decimal_digits_with_underscores(bytes);
+            self.logos.bump(1);
+            self.last_can_insert_semi = is_valid;
+
+            if !is_valid {
+                self.push_lex_diag(LexErrorKind::InvalidNumber, start..end_with_i);
+            }
+
+            return (
+                start,
+                if is_valid {
+                    Tok::ImagLit(&src[start..end_with_i])
+                } else {
+                    Tok::Error
+                },
+                end_with_i,
+            );
+        }
+
+        match info {
+            1 => {
+                self.last_can_insert_semi = true;
+                (start, Tok::IntLit(slice), end)
+            }
+            2 => {
+                self.last_can_insert_semi = true;
+                (start, Tok::FloatLit(slice), end)
+            }
+            _ => {
+                self.push_lex_diag(LexErrorKind::InvalidNumber, start..end);
+                self.last_can_insert_semi = false;
+                (start, Tok::Error, end)
+            }
         }
     }
 }
@@ -1485,141 +1570,31 @@ impl<'src> Iterator for Lexer<'src> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // 1) Emit pending token (e.g. injected ';')
-            if let Some(tok) = self.pending.take() {
-                return Some(tok);
+            // 1. Emit pending injected semicolon
+            if self.pending_semi_at != usize::MAX {
+                let pos = self.pending_semi_at;
+                self.pending_semi_at = usize::MAX;
+                return Some((pos, Tok::Semi, pos));
             }
 
-            // 2) Hard EOF
+            // 2. Check for hard EOF
             if self.eof_done {
                 return None;
             }
 
-            // 3) Next raw token
+            // 3. Get next raw token from Logos
             match self.logos.next() {
                 None => {
-                    // IMPORTANT: don't return here; allow pending ';' to be emitted next loop.
                     self.handle_eof();
                     continue;
                 }
-
-                Some(Err(kind)) => return self.handle_lex_error(kind),
-
+                Some(Err(kind)) => return Some(self.handle_lex_error(kind)),
                 Some(Ok(raw)) => {
-                    // handle_raw_token returns Option<Option<Item>>
-                    // - None            => not handled here (we just continue)
-                    // - Some(None)      => handled but emit nothing (continue)
-                    // - Some(Some(tok)) => emit tok
-                    match self.handle_raw_token(raw) {
-                        None => continue,
-                        Some(None) => continue,
-                        Some(Some(item)) => return Some(item),
+                    if let Some(item) = self.handle_raw_token(raw) {
+                        return Some(item);
                     }
+                    continue;
                 }
-            }
-        }
-    }
-}
-
-impl<'src> Lexer<'src> {
-    #[inline]
-    fn handle_eof(&mut self) {
-        self.eof_done = true;
-
-        // If semicolon insertion is needed, enqueue it into pending.
-        if self.last_can_insert_semi {
-            self.last_can_insert_semi = false;
-            self.emit_semi_at(self.src_len);
-        }
-    }
-
-    #[inline]
-    fn handle_lex_error(&mut self, kind: LexErrorKind) -> Option<(usize, Tok<'src>, usize)> {
-        let span = self.logos.span();
-        self.push_lex_diag(kind, span.clone());
-        self.last_can_insert_semi = false;
-        Some((span.start, Tok::Error, span.end))
-    }
-
-    #[inline]
-    fn handle_raw_token(&mut self, raw: RawTok) -> Option<Option<(usize, Tok<'src>, usize)>> {
-        let span = self.logos.span();
-        let slice = self.logos.slice();
-
-        // BOM: solo válido al inicio
-        if raw == RawTok::Bom {
-            return if span.start == 0 {
-                Some(None) // Ignorar, continuar loop
-            } else {
-                self.push_lex_diag(LexErrorKind::InvalidToken, span.clone());
-                self.last_can_insert_semi = false;
-                Some(Some((span.start, Tok::Error, span.end)))
-            };
-        }
-
-        // Trivia (whitespace/comentarios)
-        if self.handle_trivia(raw, &span, slice) {
-            return Some(None); // Continuar loop
-        }
-
-        // Error genérico
-        if raw == RawTok::Error {
-            self.push_lex_diag(LexErrorKind::InvalidToken, span.clone());
-            self.last_can_insert_semi = false;
-            return Some(Some((span.start, Tok::Error, span.end)));
-        }
-
-        // Números (requiere validación y lookahead para 'i')
-        if raw == RawTok::Number {
-            return Some(Some(self.handle_number_token(span, slice)));
-        }
-
-        // Token regular
-        self.last_can_insert_semi = raw.can_insert_semicolon();
-        let tok = raw.to_token(slice);
-        Some(Some((span.start, tok, span.end)))
-    }
-
-    #[inline]
-    #[rustfmt::skip]
-    fn handle_number_token(
-        &mut self,
-        span: Range<usize>,
-        slice: &'src str,
-    ) -> (usize, Tok<'src>, usize) {
-        let src = self.logos.source();
-        let bytes = slice.as_bytes();
-        let has_i_suffix = span.end < self.src_len && src.as_bytes()[span.end] == b'i';
-
-        if has_i_suffix {
-            let end_with_i = span.end + 1;
-            let is_valid = num::classify_number(bytes).is_ok() 
-                        || is_decimal_digits_with_underscores(bytes);
-            
-            self.logos.bump(1);
-            self.last_can_insert_semi = is_valid;
-            
-            if !is_valid {
-                self.push_lex_diag(LexErrorKind::InvalidNumber, span.start..end_with_i);
-            }
-            
-            return (
-                span.start,
-                if is_valid { Tok::ImagLit(&src[span.start..end_with_i]) } else { Tok::Error },
-                end_with_i
-            );
-        }
-
-        // Sin sufijo 'i': literal numérico estándar
-        match num::classify_number(bytes) {
-            Ok(is_float) => {
-                self.last_can_insert_semi = true;
-                (span.start, if is_float { Tok::FloatLit(slice) } else { Tok::IntLit(slice) }, span.end)
-            }
-            Err(kind) => {
-                self.push_lex_diag(kind, span.clone());
-                self.last_can_insert_semi = false;
-                (span.start, Tok::Error, span.end)
             }
         }
     }

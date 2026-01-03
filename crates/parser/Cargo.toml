@@ -8,11 +8,7 @@ license = "MIT OR Apache-2.0"
 logos = "0.16.0"
 lalrpop-util = "0.22.2"
 thiserror = "2.0.17"
-unicode-ident = "1.0.22"
 smallvec = "1.15.1"
-bumpalo = "3.19.1"
-la-arena = "0.3.1"
-smol_str = "0.3.4"
 ast_derive = { path = "../ast_derive" }
 memchr = "2.7.6"
 
