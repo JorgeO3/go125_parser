@@ -6,9 +6,10 @@
 pub mod ast;
 pub mod error;
 pub mod lexer;
+pub mod parser_support;
 pub mod walk;
 
 // Re-exports for convenience
 pub use lexer::Lexer;
 
-// lalrpop_util::lalrpop_mod!(pub grammar);
+lalrpop_util::lalrpop_mod!(pub parser);

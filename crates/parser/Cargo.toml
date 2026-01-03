@@ -6,14 +6,15 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 logos = "0.16.0"
-lalrpop-util = "0.22.2"
 thiserror = "2.0.17"
 smallvec = "1.15.1"
 ast_derive = { path = "../ast_derive" }
 memchr = "2.7.6"
+lalrpop-util = "0.22.2"
 
 [build-dependencies]
-lalrpop = "0.22"
+lalrpop = "0.22.2"
+gag = "1"
 
 [dev-dependencies]
 proptest = "1"

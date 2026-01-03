@@ -1,0 +1,824 @@
+use crate::ast::{self, AstArena, Span, ListRef, Interner, Symbol};
+use crate::lexer::Tok;
+use crate::error::LexErrorKind;
+use crate::parser_support::{span1, span2, span3};
+use lalrpop_util::ErrorRecovery;
+
+// =============================================================================
+// 0. Configuración del Parser
+// =============================================================================
+
+grammar<'input, 'err>(
+    arena: &mut AstArena,
+    interner: &mut Interner,
+    errors: &'err mut Vec<ErrorRecovery<usize, Tok<'input>, LexErrorKind>>
+);
+
+// =============================================================================
+// 1. Macros LR(1)
+// =============================================================================
+
+CommaPlus<T>: Vec<T> = {
+    <v:CommaPlus<T>> "," <e:T> => { let mut v = v; v.push(e); v },
+    <e:T> => vec![e],
+};
+
+CommaOpt<T>: Vec<T> = {
+    <v:CommaPlus<T>> ","? => v,
+    => vec![],
+};
+
+// =============================================================================
+// 2. Helpers (tokens con span)
+// =============================================================================
+
+IdentS: (Symbol, Span) = {
+    <l:@L> <s:"ident"> <r:@R> => (interner.intern(s), Span::new(l, r)),
+};
+
+#[inline] Ident: Symbol = { <t:IdentS> => t.0 };
+
+#[inline]
+IdentName: ast::IdentName = {
+    <t:IdentS> => ast::IdentName { sym: t.0, pos: t.1 }
+};
+
+#[inline]
+IdentList: ListRef<ast::IdentName> = { <v:CommaPlus<IdentName>> => arena.list_ident_names(v) };
+
+StringLit: ast::StringLit = {
+    <l:@L> <_s:"string_lit"> <r:@R> => ast::StringLit { raw: Span::new(l, r) },
+    <l:@L> <_s:"raw_string"> <r:@R> => ast::StringLit { raw: Span::new(l, r) },
+};
+
+TrailingComma: Span = { <c:@L> "," => span1(c) };
+
+EllipsisOpt: Option<Span> = {
+    <p:@L> "..." => Some(Span::new(p, p + 3)),
+    => None
+};
+
+// =============================================================================
+// 3. Estructura de Archivo Fuente
+// =============================================================================
+
+pub SourceFile: ast::SourceFile = {
+    <p_pos:@L> "package" <name:Ident> ";" <imports:ImportDecls> <decls:TopLevelDecls> => {
+        let mut all = imports;
+        all.extend(arena.top_decls(decls).iter().copied());
+
+        ast::SourceFile {
+            package_pos: Span::new(p_pos, p_pos + 7),
+            name,
+            decls: arena.list_top_decls(all),
+            comments: ast::ListRef::EMPTY,
+            doc: None,
+        }
+    }
+};
+
+ImportDecls: Vec<ast::TopLevelDecl> = {
+    <v:(<ImportDecl> ";")*> => v
+};
+
+TopLevelDecls: ListRef<ast::TopLevelDecl> = {
+    <v:(<TopLevelDecl> ";")*> => arena.list_top_decls(v)
+};
+
+// =============================================================================
+// 4. Declaraciones de Nivel Superior
+// =============================================================================
+
+TopLevelDecl: ast::TopLevelDecl = {
+    <d:Declaration> => ast::TopLevelDecl::Decl(d),
+    <f:FuncDecl>    => ast::TopLevelDecl::Func(f),
+    <e:!> => {
+        errors.push(e);
+        let id = arena.decls.alloc(ast::Decl::Bad, Span::new(0, 0));
+        ast::TopLevelDecl::Decl(id)
+    }
+};
+
+ImportDecl: ast::TopLevelDecl = {
+    <start:@L> "import" <spec:ImportSpec> <end:@R> => {
+        let id = arena.decls.alloc(ast::Decl::Gen(ast::GenDecl {
+            doc: None,
+            kw_pos: Span::new(start, start + 6),
+            kind: ast::GenDeclKind::Import,
+            l_paren: None,
+            specs: arena.list_specs(std::iter::once(ast::Spec::Import(spec))),
+            r_paren: None
+        }), Span::new(start, end));
+        ast::TopLevelDecl::Decl(id)
+    },
+    <start:@L> "import" "(" <v:(<ImportSpec> ";")*> ")" <end:@R> => {
+        let id = arena.decls.alloc(ast::Decl::Gen(ast::GenDecl {
+            doc: None,
+            kw_pos: Span::new(start, start + 6),
+            kind: ast::GenDeclKind::Import,
+            l_paren: Some(span1(start + 6)), // aproximado; si quieres exactitud, captura @L del "("
+            specs: arena.list_specs(v.into_iter().map(ast::Spec::Import)),
+            r_paren: Some(span1(end - 1)),
+        }), Span::new(start, end));
+        ast::TopLevelDecl::Decl(id)
+    }
+};
+
+ImportSpec: ast::ImportSpec = {
+    <start:@L> <name:ImportName?> <path:StringLit> <end:@R> => {
+        ast::ImportSpec { span: Span::new(start, end), doc: None, name, path, comment: None }
+    }
+};
+
+ImportName: ast::ImportName = {
+    "." => ast::ImportName::Dot(Span::default()),
+    "_" => ast::ImportName::Blank(Span::default()),
+    <id:Ident> => ast::ImportName::Name(id, Span::default()),
+};
+
+Declaration: ast::DeclId = {
+    "const" <v:ConstSpecList> => arena.decls.alloc(ast::Decl::Gen(v), Span::default()),
+    "var"   <v:VarSpecList>   => arena.decls.alloc(ast::Decl::Gen(v), Span::default()),
+    "type"  <v:TypeSpecList>  => arena.decls.alloc(ast::Decl::Gen(v), Span::default()),
+};
+
+ConstSpecList: ast::GenDecl = {
+    <spec:ConstSpec> => ast::GenDecl {
+        doc: None,
+        kw_pos: Span::default(),
+        kind: ast::GenDeclKind::Const,
+        l_paren: None,
+        specs: arena.list_specs(std::iter::once(ast::Spec::Value(spec))),
+        r_paren: None
+    },
+    "(" <v:(<ConstSpec> ";")*> ")" => ast::GenDecl {
+        doc: None,
+        kw_pos: Span::default(),
+        kind: ast::GenDeclKind::Const,
+        l_paren: Some(Span::default()),
+        specs: arena.list_specs(v.into_iter().map(ast::Spec::Value)),
+        r_paren: Some(Span::default())
+    }
+};
+
+VarSpecList: ast::GenDecl = {
+    <spec:VarSpec> => ast::GenDecl {
+        doc: None,
+        kw_pos: Span::default(),
+        kind: ast::GenDeclKind::Var,
+        l_paren: None,
+        specs: arena.list_specs(std::iter::once(ast::Spec::Value(spec))),
+        r_paren: None
+    },
+    "(" <v:(<VarSpec> ";")*> ")" => ast::GenDecl {
+        doc: None,
+        kw_pos: Span::default(),
+        kind: ast::GenDeclKind::Var,
+        l_paren: Some(Span::default()),
+        specs: arena.list_specs(v.into_iter().map(ast::Spec::Value)),
+        r_paren: Some(Span::default())
+    }
+};
+
+TypeSpecList: ast::GenDecl = {
+    <spec:TypeSpec> => ast::GenDecl {
+        doc: None,
+        kw_pos: Span::default(),
+        kind: ast::GenDeclKind::Type,
+        l_paren: None,
+        specs: arena.list_specs(std::iter::once(ast::Spec::Type(spec))),
+        r_paren: None
+    },
+    "(" <v:(<TypeSpec> ";")*> ")" => ast::GenDecl {
+        doc: None,
+        kw_pos: Span::default(),
+        kind: ast::GenDeclKind::Type,
+        l_paren: Some(Span::default()),
+        specs: arena.list_specs(v.into_iter().map(ast::Spec::Type)),
+        r_paren: Some(Span::default())
+    }
+};
+
+ConstSpec: ast::ValueSpec = {
+    <s:@L> <ids:IdentList> <res:ValueSpecSuffix> <e:@R> => {
+        let (typ, values) = res;
+        ast::ValueSpec { span: Span::new(s, e), doc: None, names: ids, typ, values, comment: None }
+    }
+};
+
+VarSpec: ast::ValueSpec = {
+    <s:@L> <ids:IdentList> <res:ValueSpecSuffix> <e:@R> => {
+        let (typ, values) = res;
+        ast::ValueSpec { span: Span::new(s, e), doc: None, names: ids, typ, values, comment: None }
+    }
+};
+
+ValueSpecSuffix: (Option<ast::TypeId>, ListRef<ast::ExprId>) = {
+    <t:Type> <v:("=" <ExprList>)?> => (Some(t), v.unwrap_or(ast::ListRef::EMPTY)),
+    "=" <v:ExprList> => (None, v),
+};
+
+TypeSpec: ast::TypeSpec = {
+    <s:@L> <id:Ident> <tp:TypeParameters?> <res:TypeSpecSuffix> <e:@R> => {
+        let (assign_pos, typ, alias) = res;
+        ast::TypeSpec {
+            span: Span::new(s, e),
+            doc: None,
+            name: id,
+            name_pos: Span::default(),
+            type_params: tp,
+            assign_pos,
+            typ,
+            alias,
+            comment: None
+        }
+    }
+};
+
+TypeSpecSuffix: (Option<Span>, ast::TypeId, bool) = {
+    <s:@L> "=" <t:Type> => (Some(span1(s)), t, true),
+    <t:Type> => (None, t, false),
+};
+
+// =============================================================================
+// 5. Funciones y Métodos
+//   FIX #1: body NO es opcional en FuncDecl (evita conflictos con Result/func y con "{")
+// =============================================================================
+
+FuncDecl: ast::FuncDeclId = {
+    <s:@L> "func" <r:Receiver?> <name:Ident> <tp:TypeParameters?> <sig:Signature> <body:Block> <e:@R> => {
+        arena.funcs.alloc(ast::FuncDecl {
+            doc: None,
+            func_pos: Span::new(s, s + 4),
+            recv: r,
+            name,
+            name_pos: Span::default(),
+            func_type_params: tp,
+            signature: sig,
+            body: Some(body),
+        }, Span::new(s, e))
+    },
+    // recuperación: firma sin body (consume ';' explícito/inserto)
+    <s:@L> "func" <r:Receiver?> <name:Ident> <tp:TypeParameters?> <sig:Signature> ";" <e:@R> => {
+        arena.funcs.alloc(ast::FuncDecl {
+            doc: None,
+            func_pos: Span::new(s, s + 4),
+            recv: r,
+            name,
+            name_pos: Span::default(),
+            func_type_params: tp,
+            signature: sig,
+            body: None,
+        }, Span::new(s, e))
+    }
+};
+
+Receiver: ast::Receiver = {
+    <sl:@L> "(" <n:IdentName?> <t:Type> <tr:@R> ")" => {
+        ast::Receiver {
+            l_paren: span1(sl),
+            name: n,
+            typ: t,
+            type_params: None,
+            r_paren: span1(tr - 1)
+        }
+    }
+};
+
+// =============================================================================
+// 6. Tipos y Genéricos
+//   FIX #2: Result usa TypeNoParen para que `func f() (T)` sea SIEMPRE Results::Params
+//   FIX #3: NamedType integrado (sin TypeName separado) para evitar reduce/shift prematuro
+// =============================================================================
+
+Type: ast::TypeId = {
+    TypeNoParen,
+    <s:@L> "(" <t:Type> ")" <e:@R> => arena.types.alloc(
+        ast::Type::Paren { l_paren: span1(s), typ: t, r_paren: span1(e - 1) },
+        Span::new(s, e)
+    ),
+};
+
+TypeNoParen: ast::TypeId = {
+    NamedType,
+    TypeLit,
+};
+
+NamedType: ast::TypeId = {
+    // pkg.Name[Args]
+    <s:@L> <pkg:IdentS> <dot:@L> "." <name:IdentS> <args:TypeArgs> <e:@R> => {
+        let (pkg_sym, pkg_pos) = pkg;
+        let (name_sym, name_pos) = name;
+        let (lb, list, tc, rb) = args;
+        arena.types.alloc(ast::Type::Named {
+            pkg: Some(pkg_sym),
+            pkg_pos: Some(pkg_pos),
+            dot_pos: Some(span1(dot)),
+            name: name_sym,
+            name_pos,
+            args_lbrack: Some(lb),
+            args: list,
+            args_trailing_comma: tc,
+            args_rbrack: Some(rb),
+        }, Span::new(s, e))
+    },
+
+    // pkg.Name
+    <s:@L> <pkg:IdentS> <dot:@L> "." <name:IdentS> <e:@R> => {
+        let (pkg_sym, pkg_pos) = pkg;
+        let (name_sym, name_pos) = name;
+        arena.types.alloc(ast::Type::Named {
+            pkg: Some(pkg_sym),
+            pkg_pos: Some(pkg_pos),
+            dot_pos: Some(span1(dot)),
+            name: name_sym,
+            name_pos,
+            args_lbrack: None,
+            args: ast::ListRef::EMPTY,
+            args_trailing_comma: None,
+            args_rbrack: None,
+        }, Span::new(s, e))
+    },
+
+    // Name[Args]
+    <s:@L> <name:IdentS> <args:TypeArgs> <e:@R> => {
+        let (sym, name_pos) = name;
+        let (lb, list, tc, rb) = args;
+        arena.types.alloc(ast::Type::Named {
+            pkg: None,
+            pkg_pos: None,
+            dot_pos: None,
+            name: sym,
+            name_pos,
+            args_lbrack: Some(lb),
+            args: list,
+            args_trailing_comma: tc,
+            args_rbrack: Some(rb),
+        }, Span::new(s, e))
+    },
+
+    // Name
+    <s:@L> <name:IdentS> <e:@R> => {
+        let (sym, name_pos) = name;
+        arena.types.alloc(ast::Type::Named {
+            pkg: None,
+            pkg_pos: None,
+            dot_pos: None,
+            name: sym,
+            name_pos,
+            args_lbrack: None,
+            args: ast::ListRef::EMPTY,
+            args_trailing_comma: None,
+            args_rbrack: None,
+        }, Span::new(s, e))
+    }
+};
+
+TypeArgs: (Span, ListRef<ast::TypeId>, Option<Span>, Span) = {
+    <l:@L> "[" <types:CommaPlus<Type>> "]" <r:@R> => {
+        (span1(l), arena.list_types(types), None, span1(r - 1))
+    },
+    <l:@L> "[" <types:CommaPlus<Type>> <c:@L> "," "]" <r:@R> => {
+        (span1(l), arena.list_types(types), Some(span1(c)), span1(r - 1))
+    },
+};
+
+TypeParameters: ast::TypeParamsId = {
+    <l:@L> "[" <params:CommaPlus<TypeParamDecl>> "]" <r:@R> => {
+        arena.type_params.alloc(ast::TypeParams {
+            l_brack: span1(l),
+            params: arena.list_type_param_decl_ids(params),
+            trailing_comma: None,
+            r_brack: span1(r - 1),
+        }, Span::new(l, r))
+    },
+    <l:@L> "[" <params:CommaPlus<TypeParamDecl>> <c:@L> "," "]" <r:@R> => {
+        arena.type_params.alloc(ast::TypeParams {
+            l_brack: span1(l),
+            params: arena.list_type_param_decl_ids(params),
+            trailing_comma: Some(span1(c)),
+            r_brack: span1(r - 1),
+        }, Span::new(l, r))
+    }
+};
+
+TypeParamDecl: ast::TypeParamDeclId = {
+    <ids:IdentList> <constraint:Type> => arena.type_param_decls.alloc(
+        ast::TypeParamDecl { names: ids, constraint: ast::TypeConstraint::Interface(constraint) },
+        Span::default()
+    )
+};
+
+TypeLit: ast::TypeId = {
+    ArrayType,
+    SliceType,
+    StructType,
+    PointerType,
+    FunctionType,
+    InterfaceType,
+    MapType,
+
+    // Channel types INLINE (elimina ChannelType no-terminal)
+    "chan" <t:Type> => arena.types.alloc(
+        ast::Type::Chan {
+            dir: ast::ChanDir::Both,
+            chan_pos: Span::default(),
+            recv_arrow_pos: None,
+            send_arrow_pos: None,
+            elem: t
+        },
+        Span::default()
+    ),
+
+    "chan" "<-" <t:Type> => arena.types.alloc(
+        ast::Type::Chan {
+            dir: ast::ChanDir::Send,
+            chan_pos: Span::default(),
+            recv_arrow_pos: None,
+            send_arrow_pos: Some(Span::default()),
+            elem: t
+        },
+        Span::default()
+    ),
+
+    <as:@L> "<-" "chan" <t:Type> => arena.types.alloc(
+        ast::Type::Chan {
+            dir: ast::ChanDir::Recv,
+            chan_pos: Span::default(),
+            recv_arrow_pos: Some(span2(as)),
+            send_arrow_pos: None,
+            elem: t
+        },
+        Span::default()
+    )
+};
+
+ArrayType: ast::TypeId = {
+    <s:@L> "[" <len:Expr> "]" <elem:Type> <e:@R> => arena.types.alloc(
+        ast::Type::Array {
+            l_brack: span1(s),
+            len: ast::ArrayLen::Expr(len),
+            r_brack: Span::default(),
+            elem
+        },
+        Span::new(s, e)
+    )
+};
+
+SliceType: ast::TypeId = {
+    <s:@L> "[" "]" <elem:Type> <e:@R> => arena.types.alloc(
+        ast::Type::Slice { l_brack: span1(s), r_brack: span1(s + 1), elem },
+        Span::new(s, e)
+    )
+};
+
+// Struct tags fuera del core del field
+StructType: ast::TypeId = {
+    <s:@L> "struct" "{" <fields:StructFieldList> "}" <e:@R> => arena.types.alloc(
+        ast::Type::Struct {
+            struct_pos: Span::new(s, s + 6),
+            l_brace: Span::default(),
+            fields: arena.list_fields(fields),
+            r_brace: Span::default(),
+        },
+        Span::new(s, e)
+    )
+};
+
+StructFieldList: Vec<ast::FieldId> = {
+    <v:(<StructField> ";")*> => v
+};
+
+StructField: ast::FieldId = {
+    <core:FieldDeclCore> <tag:StringLit> => {
+        let (mut f, sp) = core;
+        f.tag = Some(tag);
+        arena.fields.alloc(f, sp)
+    },
+    <core:FieldDeclCore> => {
+        let (f, sp) = core;
+        arena.fields.alloc(f, sp)
+    }
+};
+
+FieldDeclCore: (ast::Field, Span) = {
+    <s:@L> <ids:IdentList> <t:Type> <e:@R> => (
+        ast::Field {
+            names: ids,
+            ellipsis_pos: None,
+            typ: t,
+            tag: None,
+            is_embed: false,
+            comma: None,
+            doc: None,
+            comment: None
+        },
+        Span::new(s, e)
+    ),
+
+    <s:@L> <star_pos:@L> "*" <t:EmbeddedNamedType> <e:@R> => {
+        let ptr = arena.types.alloc(
+            ast::Type::Pointer { star_pos: span1(star_pos), elem: t },
+            Span::new(s, e)
+        );
+        (
+            ast::Field {
+                names: ast::ListRef::EMPTY,
+                ellipsis_pos: None,
+                typ: ptr,
+                tag: None,
+                is_embed: true,
+                comma: None,
+                doc: None,
+                comment: None
+            },
+            Span::new(s, e)
+        )
+    },
+
+    <s:@L> <t:EmbeddedNamedType> <e:@R> => (
+        ast::Field {
+            names: ast::ListRef::EMPTY,
+            ellipsis_pos: None,
+            typ: t,
+            tag: None,
+            is_embed: true,
+            comma: None,
+            doc: None,
+            comment: None
+        },
+        Span::new(s, e)
+    )
+};
+
+EmbeddedNamedType: ast::TypeId = { NamedType };
+
+PointerType: ast::TypeId = {
+    <s:@L> "*" <base:Type> <e:@R> => arena.types.alloc(
+        ast::Type::Pointer { star_pos: span1(s), elem: base },
+        Span::new(s, e)
+    )
+};
+
+FunctionType: ast::TypeId = {
+    <s:@L> "func" <sig:Signature> <e:@R> => arena.types.alloc(
+        ast::Type::Func { func_pos: Span::new(s, s + 4), sig },
+        Span::new(s, e)
+    )
+};
+
+Signature: ast::SignatureId = {
+    <params:Parameters> <res:ResultOpt> => arena.signatures.alloc(
+        ast::Signature { params, results: res },
+        Span::default()
+    )
+};
+
+ResultOpt: Option<ast::Results> = {
+    <r:Result> => Some(r),
+    => None
+};
+
+Result: ast::Results = {
+    Parameters => ast::Results::Params(<>),
+    TypeNoParen => ast::Results::Type(<>)
+};
+
+Parameters: ast::FieldList = {
+    <l:@L> "(" ")" <r:@R> => ast::FieldList {
+        l_paren: span1(l),
+        fields: ast::ListRef::EMPTY,
+        trailing_comma: None,
+        r_paren: span1(r - 1),
+    },
+
+    <l:@L> "(" <p:CommaPlus<ParameterDecl>> ")" <r:@R> => ast::FieldList {
+        l_paren: span1(l),
+        fields: arena.list_fields(p),
+        trailing_comma: None,
+        r_paren: span1(r - 1),
+    },
+
+    <l:@L> "(" <p:CommaPlus<ParameterDecl>> <c:@L> "," ")" <r:@R> => ast::FieldList {
+        l_paren: span1(l),
+        fields: arena.list_fields(p),
+        trailing_comma: Some(span1(c)),
+        r_paren: span1(r - 1),
+    }
+};
+
+ParameterDecl: ast::FieldId = {
+    // names ... Type
+    <s:@L> <ids:IdentList> <p:@L> "..." <t:Type> <e:@R> => arena.fields.alloc(
+        ast::Field {
+            names: ids,
+            ellipsis_pos: Some(Span::new(p, p + 3)),
+            typ: t,
+            tag: None,
+            is_embed: false,
+            comma: None,
+            doc: None,
+            comment: None,
+        },
+        Span::new(s, e)
+    ),
+
+    // names Type
+    <s:@L> <ids:IdentList> <t:Type> <e:@R> => arena.fields.alloc(
+        ast::Field {
+            names: ids,
+            ellipsis_pos: None,
+            typ: t,
+            tag: None,
+            is_embed: false,
+            comma: None,
+            doc: None,
+            comment: None,
+        },
+        Span::new(s, e)
+    ),
+
+    // ... Type
+    <s:@L> <p:@L> "..." <t:Type> <e:@R> => arena.fields.alloc(
+        ast::Field {
+            names: ast::ListRef::EMPTY,
+            ellipsis_pos: Some(Span::new(p, p + 3)),
+            typ: t,
+            tag: None,
+            is_embed: false,
+            comma: None,
+            doc: None,
+            comment: None,
+        },
+        Span::new(s, e)
+    ),
+
+    // Type
+    <s:@L> <t:Type> <e:@R> => arena.fields.alloc(
+        ast::Field {
+            names: ast::ListRef::EMPTY,
+            ellipsis_pos: None,
+            typ: t,
+            tag: None,
+            is_embed: false,
+            comma: None,
+            doc: None,
+            comment: None,
+        },
+        Span::new(s, e)
+    ),
+};
+
+InterfaceType: ast::TypeId = {
+    <s:@L> "interface" "{" <elems:(<InterfaceElem> ";")*> "}" <e:@R> => arena.types.alloc(
+        ast::Type::Interface {
+            interface_pos: Span::new(s, s + 9),
+            l_brace: Span::default(),
+            elems: arena.list_interface_elems(elems),
+            r_brace: Span::default()
+        },
+        Span::new(s, e)
+    )
+};
+
+InterfaceElem: ast::InterfaceElem = {
+    <s:@L> <name:Ident> <sig:Signature> <e:@R> =>
+        ast::InterfaceElem::Method { span: Span::new(s, e), name, name_pos: Span::default(), sig },
+
+    <s:@L> <elem:TypeElem> <e:@R> =>
+        ast::InterfaceElem::TypeElem { span: Span::new(s, e), elem }
+};
+
+// Unión con '|' sin macro PipePlus (reduce conflictos)
+TypeElem: ast::TypeElem = {
+    <s:@L> <u:TypeUnion> <e:@R> => {
+        let (terms, pipes) = u;
+        ast::TypeElem {
+            span: Span::new(s, e),
+            terms: arena.list_type_terms(terms),
+            pipe_pos: arena.list_spans(pipes)
+        }
+    }
+};
+
+TypeUnion: (Vec<ast::TypeTerm>, Vec<Span>) = {
+    #[precedence(level="1")]
+    <u:TypeUnion> <p:@L> "|" <t:TypeTerm> => {
+        let (mut terms, mut pipes) = u;
+        pipes.push(span1(p));
+        terms.push(t);
+        (terms, pipes)
+    },
+
+    #[precedence(level="0")]
+    <t:TypeTerm> => (vec![t], vec![])
+};
+
+PipeTypeTerm: (usize, ast::TypeTerm) = {
+    <p:@L> "|" <t:TypeTerm> => (p, t)
+};
+
+TypeTerm: ast::TypeTerm = {
+    <s:@L> <t:Type> <e:@R> => ast::TypeTerm::Type { span: Span::new(s, e), typ: t },
+    <s:@L> "~" <t:Type> <e:@R> => ast::TypeTerm::Tilde { span: Span::new(s, e), tilde_pos: span1(s), typ: t }
+};
+
+MapType: ast::TypeId = {
+    <s:@L> "map" "[" <k:Type> "]" <v:Type> <e:@R> => arena.types.alloc(
+        ast::Type::Map {
+            map_pos: Span::new(s, s + 3),
+            l_brack: Span::default(),
+            key: k,
+            r_brack: Span::default(),
+            val: v
+        },
+        Span::new(s, e)
+    )
+};
+
+ChannelType: ast::TypeId = {
+    "chan" <t:Type> => arena.types.alloc(
+        ast::Type::Chan { dir: ast::ChanDir::Both, chan_pos: Span::default(), recv_arrow_pos: None, send_arrow_pos: None, elem: t },
+        Span::default()
+    ),
+    "chan" "<-" <t:Type> => arena.types.alloc(
+        ast::Type::Chan { dir: ast::ChanDir::Send, chan_pos: Span::default(), recv_arrow_pos: None, send_arrow_pos: Some(Span::default()), elem: t },
+        Span::default()
+    ),
+    <as:@L> "<-" "chan" <t:Type> => arena.types.alloc(
+        ast::Type::Chan { dir: ast::ChanDir::Recv, chan_pos: Span::default(), recv_arrow_pos: Some(span2(as)), send_arrow_pos: None, elem: t },
+        Span::default()
+    )
+};
+
+// =============================================================================
+// 7. Sentencias y Expresiones (mínimo, completa luego)
+// =============================================================================
+
+Block: ast::Block = {
+    <lb:@L> "{" <stmts:StatementList> <rb:@L> "}" =>
+        ast::Block { l_brace: span1(lb), stmts, r_brace: span1(rb) }
+};
+
+StatementList: ListRef<ast::StmtId> = {
+    <v:(<Statement> ";")*> => arena.list_stmts(v)
+};
+
+Statement: ast::StmtId = {
+    <s:@L> "return" <_v:ExprList?> <e:@R> =>
+        arena.stmts.alloc(ast::Stmt::Bad(Span::new(s, e)), Span::new(s, e)),
+};
+
+ExprList: ListRef<ast::ExprId> = { <v:CommaPlus<Expr>> => arena.list_exprs(v) };
+
+Expr: ast::ExprId = {
+    <l:@L> <id:Ident> <r:@R> => arena.exprs.alloc(ast::Expr::Ident(id, Span::new(l, r)), Span::new(l, r))
+};
+
+// =============================================================================
+// 8. Extern (TOKENS) - debe calzar con tu Tok<'input>
+// =============================================================================
+
+extern {
+    type Location = usize;
+    type Error = LexErrorKind;
+
+    enum Tok<'input> {
+        "ident"      => Tok::Ident(<&'input str>),
+        "int_lit"    => Tok::IntLit(<&'input str>),
+        "float_lit"  => Tok::FloatLit(<&'input str>),
+        "imag_lit"   => Tok::ImagLit(<&'input str>),
+        "rune_lit"   => Tok::RuneLit(<&'input str>),
+        "string_lit" => Tok::StringLit(<&'input str>),
+        "raw_string" => Tok::RawStringLit(<&'input str>),
+
+        "package"    => Tok::KwPackage,
+        "import"     => Tok::KwImport,
+        "func"       => Tok::KwFunc,
+        "var"        => Tok::KwVar,
+        "const"      => Tok::KwConst,
+        "type"       => Tok::KwType,
+        "struct"     => Tok::KwStruct,
+        "interface"  => Tok::KwInterface,
+        "map"        => Tok::KwMap,
+        "chan"       => Tok::KwChan,
+        "return"     => Tok::KwReturn,
+
+        ";"          => Tok::Semi,
+        ","          => Tok::Comma,
+        "."          => Tok::Dot,
+        "("          => Tok::LParen,
+        ")"          => Tok::RParen,
+        "{"          => Tok::LBrace,
+        "}"          => Tok::RBrace,
+        "["          => Tok::LBrack,
+        "]"          => Tok::RBrack,
+        "*"          => Tok::Star,
+        "~"          => Tok::Tilde,
+        "|"          => Tok::Pipe,
+        "<-"         => Tok::Arrow,
+        "="          => Tok::Assign,
+        "..."        => Tok::Ellipsis,
+        "_"          => Tok::Ident("_"),
+    }
+}

@@ -798,7 +798,7 @@ mod num {
         use NumCharClass as NCC;
 
         let mut t = [NCC::Other as u8; 256];
-        t[b'0' as usize] = NCC::Zero as u8; 
+        t[b'0' as usize] = NCC::Zero as u8;
         t[b'1' as usize] = NCC::One as u8;
 
         let mut i = b'2';
@@ -854,95 +854,97 @@ mod num {
         use NumCharClass as NCC;
         use NumState as NS;
         // Start state
-        tr!(NS::Start, [NCC::Zero] => NS::Zero); 
+        tr!(NS::Start, [NCC::Zero] => NS::Zero);
         tr!(NS::Start, [NCC::One, NCC::Oct, NCC::Dec] => NS::DecInt);
         tr!(NS::Start, [NCC::Dot] => NS::DotStart);
-        
+
         // Zero state (prefix detection)
-        tr!(NS::Zero, [NCC::X] => NS::PreHex); 
-        tr!(NS::Zero, [NCC::O] => NS::PreOct); 
+        tr!(NS::Zero, [NCC::X] => NS::PreHex);
+        tr!(NS::Zero, [NCC::O] => NS::PreOct);
         tr!(NS::Zero, [NCC::B] => NS::PreBin);
-        tr!(NS::Zero, [NCC::Dot] => NS::DecDot); 
+        tr!(NS::Zero, [NCC::Dot] => NS::DecDot);
         tr!(NS::Zero, [NCC::E] => NS::DecExpStart);
-        tr!(NS::Zero, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct); 
+        tr!(NS::Zero, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct);
         tr!(NS::Zero, [NCC::Us] => NS::LegacyOctUs);
         tr!(NS::Zero, [NCC::Dec] => NS::BadLead);
-        
+
         // Decimal integer
-        tr!(NS::DecInt, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecInt); 
+        tr!(NS::DecInt, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecInt);
         tr!(NS::DecInt, [NCC::Us] => NS::DecIntUs);
-        tr!(NS::DecInt, [NCC::Dot] => NS::DecDot); 
+        tr!(NS::DecInt, [NCC::Dot] => NS::DecDot);
         tr!(NS::DecInt, [NCC::E] => NS::DecExpStart);
         tr!(NS::DecIntUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecInt);
-        
+
         // Legacy octal
-        tr!(NS::LegacyOct, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct); 
+        tr!(NS::LegacyOct, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct);
         tr!(NS::LegacyOct, [NCC::Us] => NS::LegacyOctUs);
-        tr!(NS::LegacyOct, [NCC::Dec] => NS::BadLead); 
+        tr!(NS::LegacyOct, [NCC::Dec] => NS::BadLead);
         tr!(NS::LegacyOct, [NCC::Dot] => NS::DecDot);
-        tr!(NS::LegacyOct, [NCC::E] => NS::DecExpStart); 
+        tr!(NS::LegacyOct, [NCC::E] => NS::DecExpStart);
         tr!(NS::LegacyOctUs, [NCC::Zero, NCC::One, NCC::Oct] => NS::LegacyOct);
         tr!(NS::LegacyOctUs, [NCC::Dec] => NS::BadLead);
 
         // Bad leading digit
-        tr!(NS::BadLead, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::BadLead); 
+        tr!(NS::BadLead, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::BadLead);
         tr!(NS::BadLead, [NCC::Us] => NS::BadLeadUs);
-        tr!(NS::BadLead, [NCC::Dot] => NS::DecDot); 
+        tr!(NS::BadLead, [NCC::Dot] => NS::DecDot);
         tr!(NS::BadLead, [NCC::E] => NS::DecExpStart);
         tr!(NS::BadLeadUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::BadLead);
-        
+
         // Decimal float
         tr!(NS::DotStart, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac);
-        tr!(NS::DecDot, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac); 
+        tr!(NS::DecDot, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac);
         tr!(NS::DecDot, [NCC::E] => NS::DecExpStart);
-        tr!(NS::DecFrac, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac); 
+        tr!(NS::DecFrac, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac);
         tr!(NS::DecFrac, [NCC::Us] => NS::DecFracUs);
-        tr!(NS::DecFrac, [NCC::E] => NS::DecExpStart); 
+        tr!(NS::DecFrac, [NCC::E] => NS::DecExpStart);
         tr!(NS::DecFracUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecFrac);
-        
+
         // Decimal exponent
-        tr!(NS::DecExpStart, [NCC::Sign] => NS::DecExpSign); 
+        tr!(NS::DecExpStart, [NCC::Sign] => NS::DecExpSign);
         tr!(NS::DecExpStart, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp);
         tr!(NS::DecExpSign, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp);
-        tr!(NS::DecExp, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp); 
+        tr!(NS::DecExp, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp);
         tr!(NS::DecExp, [NCC::Us] => NS::DecExpUs);
         tr!(NS::DecExpUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::DecExp);
-        
+
         // Hexadecimal
-        tr!(NS::PreHex, [NCC::Us] => NS::HexIntUs); 
+        tr!(NS::PreHex, [NCC::Us] => NS::HexIntUs);
         tr!(NS::PreHex, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexInt);
         tr!(NS::PreHex, [NCC::Dot] => NS::HexDotNoDig);
-        tr!(NS::HexInt, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexInt); 
+        tr!(NS::HexInt, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexInt);
         tr!(NS::HexInt, [NCC::Us] => NS::HexIntUs);
-        tr!(NS::HexInt, [NCC::Dot] => NS::HexDotHaveDig); 
+        tr!(NS::HexInt, [NCC::Dot] => NS::HexDotHaveDig);
         tr!(NS::HexInt, [NCC::P] => NS::HexExpStart);
         tr!(NS::HexIntUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexInt);
         tr!(NS::HexDotNoDig, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac);
         tr!(NS::HexDotHaveDig, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac);
         tr!(NS::HexDotHaveDig, [NCC::P] => NS::HexExpStart);
-        tr!(NS::HexFrac, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac); 
+        tr!(NS::HexFrac, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac);
         tr!(NS::HexFrac, [NCC::Us] => NS::HexFracUs);
-        tr!(NS::HexFrac, [NCC::P] => NS::HexExpStart); 
+        tr!(NS::HexFrac, [NCC::P] => NS::HexExpStart);
         tr!(NS::HexFracUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec, NCC::Hex, NCC::B, NCC::E] => NS::HexFrac);
 
         // Hex exponent
-        tr!(NS::HexExpStart, [NCC::Sign] => NS::HexExpSign); 
+        tr!(NS::HexExpStart, [NCC::Sign] => NS::HexExpSign);
         tr!(NS::HexExpStart, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp);
         tr!(NS::HexExpSign, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp);
-        tr!(NS::HexExp, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp); 
+        tr!(NS::HexExp, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp);
         tr!(NS::HexExp, [NCC::Us] => NS::HexExpUs);
         tr!(NS::HexExpUs, [NCC::Zero, NCC::One, NCC::Oct, NCC::Dec] => NS::HexExp);
 
         // Octal (0o prefix)
-        tr!(NS::PreOct, [NCC::Us] => NS::OctIntUs); 
+        tr!(NS::PreOct, [NCC::Us] => NS::OctIntUs);
         tr!(NS::PreOct, [NCC::Zero, NCC::One, NCC::Oct] => NS::OctInt);
-        tr!(NS::OctInt, [NCC::Zero, NCC::One, NCC::Oct] => NS::OctInt); 
+        tr!(NS::OctInt, [NCC::Zero, NCC::One, NCC::Oct] => NS::OctInt);
         tr!(NS::OctInt, [NCC::Us] => NS::OctIntUs);
         tr!(NS::OctIntUs, [NCC::Zero, NCC::One, NCC::Oct] => NS::OctInt);
-        
+
         // Binary
-        tr!(NS::PreBin, [NCC::Us] => NS::BinIntUs); tr!(NS::PreBin, [NCC::Zero, NCC::One] => NS::BinInt);
-        tr!(NS::BinInt, [NCC::Zero, NCC::One] => NS::BinInt); tr!(NS::BinInt, [NCC::Us] => NS::BinIntUs);
+        tr!(NS::PreBin, [NCC::Us] => NS::BinIntUs);
+        tr!(NS::PreBin, [NCC::Zero, NCC::One] => NS::BinInt);
+        tr!(NS::BinInt, [NCC::Zero, NCC::One] => NS::BinInt);
+        tr!(NS::BinInt, [NCC::Us] => NS::BinIntUs);
         tr!(NS::BinIntUs, [NCC::Zero, NCC::One] => NS::BinInt);
         t
     };
@@ -1290,15 +1292,15 @@ const SEMI_INSERT_TABLE: [bool; RAWTOK_COUNT] = gen_lookup_table!(
 );
 
 const TOKEN_KIND_TABLE: [TokKind; RAWTOK_COUNT] = gen_lookup_table!(
-    TokKind, RAWTOK_COUNT, 
+    TokKind, RAWTOK_COUNT,
     TokKind::Simple,
-    Newline => TokKind::Trivia, 
-    _LineComment => TokKind::Trivia, 
+    Newline => TokKind::Trivia,
+    _LineComment => TokKind::Trivia,
     BlockComment => TokKind::Trivia,
-    Ident => TokKind::Literal, 
-    Number => TokKind::Literal, 
+    Ident => TokKind::Literal,
+    Number => TokKind::Literal,
     Rune => TokKind::Literal,
-    String => TokKind::Literal, 
+    String => TokKind::Literal,
     RawString => TokKind::Literal,
 );
 
@@ -1336,7 +1338,7 @@ impl RawTok {
                 }
             };
         }
-        
+
         simple_tok! {
             KwBreak => KwBreak, KwCase => KwCase, KwChan => KwChan, KwConst => KwConst,
             KwContinue => KwContinue, KwDefault => KwDefault, KwDefer => KwDefer, KwElse => KwElse,
@@ -1366,16 +1368,87 @@ impl RawTok {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok<'input> {
-    Ident(&'input str), IntLit(&'input str), FloatLit(&'input str), ImagLit(&'input str),
-    RuneLit(&'input str), StringLit(&'input str), RawStringLit(&'input str),
-    KwBreak, KwCase, KwChan, KwConst, KwContinue, KwDefault, KwDefer, KwElse,
-    KwFallthrough, KwFor, KwFunc, KwGo, KwGoto, KwIf, KwImport, KwInterface,
-    KwMap, KwPackage, KwRange, KwReturn, KwSelect, KwStruct, KwSwitch, KwType, KwVar,
-    Ellipsis, ShlAssign, ShrAssign, AndNotAssign, AddAssign, SubAssign, MulAssign,
-    DivAssign, ModAssign, AndAssign, OrAssign, XorAssign, Shl, Shr, AndNot,
-    LAnd, LOr, EqEq, NotEq, Le, Ge, Inc, Dec, Define, Arrow, Assign, Plus, Minus,
-    Star, Slash, Percent, Amp, Pipe, Caret, Tilde, Bang, Lt, Gt,
-    LParen, RParen, LBrack, RBrack, LBrace, RBrace, Comma, Semi, Colon, Dot, Error,
+    Ident(&'input str),
+    IntLit(&'input str),
+    FloatLit(&'input str),
+    ImagLit(&'input str),
+    RuneLit(&'input str),
+    StringLit(&'input str),
+    RawStringLit(&'input str),
+    KwBreak,
+    KwCase,
+    KwChan,
+    KwConst,
+    KwContinue,
+    KwDefault,
+    KwDefer,
+    KwElse,
+    KwFallthrough,
+    KwFor,
+    KwFunc,
+    KwGo,
+    KwGoto,
+    KwIf,
+    KwImport,
+    KwInterface,
+    KwMap,
+    KwPackage,
+    KwRange,
+    KwReturn,
+    KwSelect,
+    KwStruct,
+    KwSwitch,
+    KwType,
+    KwVar,
+    Ellipsis,
+    ShlAssign,
+    ShrAssign,
+    AndNotAssign,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    ModAssign,
+    AndAssign,
+    OrAssign,
+    XorAssign,
+    Shl,
+    Shr,
+    AndNot,
+    LAnd,
+    LOr,
+    EqEq,
+    NotEq,
+    Le,
+    Ge,
+    Inc,
+    Dec,
+    Define,
+    Arrow,
+    Assign,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Bang,
+    Lt,
+    Gt,
+    LParen,
+    RParen,
+    LBrack,
+    RBrack,
+    LBrace,
+    RBrace,
+    Comma,
+    Semi,
+    Colon,
+    Dot,
+    Error,
 }
 
 impl<'input> std::fmt::Display for Tok<'input> {
