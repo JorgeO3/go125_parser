@@ -8,6 +8,7 @@ fn main() {
     let (result, stdout, stderr) = capture_stdio(|| {
         lalrpop::Configuration::new()
             .emit_rerun_directives(true)
+            .use_cargo_dir_conventions()
             .process_file(&grammar)
     });
 
