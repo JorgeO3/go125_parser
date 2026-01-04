@@ -1182,7 +1182,8 @@ enum RawTok {
     #[token("var")] KwVar,
     
     // Identifiers & Literals
-    #[regex(r"[_\p{L}][_\p{L}\p{Nd}]*")] Ident,
+    #[token("_")] Underscore,
+    #[regex(r"(?:\p{L}[_\p{L}\p{Nd}]*)|(?:_[_\p{L}\p{Nd}]+)")] Ident,
     #[regex(r"[0-9]|\.[0-9]", num::lex_number)] Number,
     #[token("`", lex_raw_string)] RawString,
     #[token("\"", esc::lex_interpreted_string)] String,
@@ -1276,6 +1277,7 @@ const SEMI_INSERT_TABLE: [bool; RAWTOK_COUNT] = gen_lookup_table!(
     bool, 
     RAWTOK_COUNT,
     Ident, 
+    Underscore,
     Number, 
     Rune, 
     String, 
@@ -1298,6 +1300,7 @@ const TOKEN_KIND_TABLE: [TokKind; RAWTOK_COUNT] = gen_lookup_table!(
     _LineComment => TokKind::Trivia,
     BlockComment => TokKind::Trivia,
     Ident => TokKind::Literal,
+    Underscore => TokKind::Literal,
     Number => TokKind::Literal,
     Rune => TokKind::Literal,
     String => TokKind::Literal,
@@ -1322,6 +1325,7 @@ impl RawTok {
         if matches!(self.kind(), TokKind::Literal) {
             return match self {
                 Self::Ident => Tok::Ident(slice),
+                Self::Underscore => Tok::Underscore,
                 Self::Rune => Tok::RuneLit(slice),
                 Self::String => Tok::StringLit(slice),
                 Self::RawString => Tok::RawStringLit(slice),
@@ -1375,6 +1379,7 @@ pub enum Tok<'input> {
     RuneLit(&'input str),
     StringLit(&'input str),
     RawStringLit(&'input str),
+    Underscore,
     KwBreak,
     KwCase,
     KwChan,

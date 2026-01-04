@@ -1,4 +1,6 @@
 use crate::ast::{self, ListRef, Span, Symbol};
+use crate::error;
+use crate::lexer::Tok;
 
 #[inline(always)]
 pub fn span1(pos: usize) -> Span {
@@ -46,10 +48,7 @@ pub struct ParamDecl {
     pub span: Span,
 }
 
-pub fn resolve_param_list(
-    arena: &mut ast::AstArena,
-    params: Vec<ParamDecl>,
-) -> Vec<ast::FieldId> {
+pub fn resolve_param_list(arena: &mut ast::AstArena, params: Vec<ParamDecl>) -> Vec<ast::FieldId> {
     let mut out = Vec::new();
     let mut pending_names: Vec<ast::IdentName> = Vec::new();
     let mut pending_start: Option<u32> = None;
@@ -128,4 +127,19 @@ fn named_type_from_ident(arena: &mut ast::AstArena, name: ast::IdentName) -> ast
         },
         name.pos,
     )
+}
+
+pub fn recovery_loc<'input>(
+    e: &lalrpop_util::ErrorRecovery<usize, Tok<'input>, error::LexErrorKind>,
+) -> usize {
+    use lalrpop_util::ParseError::*;
+    match &e.error {
+        InvalidToken { location } => *location,
+        UnrecognizedEof { location, .. } => *location,
+        UnrecognizedToken {
+            token: (l, _, _), ..
+        } => *l,
+        ExtraToken { token: (l, _, _) } => *l,
+        User { .. } => e.dropped_tokens.last().map(|(l, _, _)| *l).unwrap_or(0),
+    }
 }

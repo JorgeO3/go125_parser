@@ -47,6 +47,8 @@ fn kinds_short(toks: &[(usize, Tok<'_>, usize)]) -> Vec<&'static str> {
 
 fn kind_name(t: &Tok<'_>) -> &'static str {
     match t {
+        Tok::Underscore => "Underscore",
+
         Tok::Ident(_) => "Ident",
         Tok::IntLit(_) => "IntLit",
         Tok::FloatLit(_) => "FloatLit",
@@ -336,7 +338,7 @@ fn imag_lookahead_must_not_consume_i_when_followed_by_digit() {
 fn imag_lookahead_must_not_consume_i_when_followed_by_underscore() {
     let (t1, t2, _diags) = lex2("1i_");
     assert!(matches!(t1, Tok::ImagLit("1i")), "t1={t1:?}");
-    assert!(matches!(t2, Tok::Ident("_")), "t2={t2:?}");
+    assert!(matches!(t2, Tok::Underscore), "t2={t2:?}");
 }
 
 #[test]

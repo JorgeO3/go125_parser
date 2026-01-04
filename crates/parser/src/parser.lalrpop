@@ -1,7 +1,7 @@
 use crate::ast::{self, AstArena, Span, ListRef, Interner, Symbol};
 use crate::lexer::Tok;
 use crate::error::LexErrorKind;
-use crate::parser_support::{resolve_param_list, span1, span2, span3, ParamDecl};
+use crate::parser_support::{resolve_param_list, span1, span2, span3, ParamDecl, recovery_loc};
 use lalrpop_util::ErrorRecovery;
 
 // =============================================================================
@@ -15,17 +15,45 @@ grammar<'input, 'err>(
 );
 
 // =============================================================================
-// 1. Macros LR(1)
+// 1. Macros LR(1) (DRY)
 // =============================================================================
 
+// 1+ elementos separados por coma (sin cola ε)
 CommaPlus<T>: Vec<T> = {
     <v:CommaPlus<T>> "," <e:T> => { let mut v = v; v.push(e); v },
     <e:T> => vec![e],
 };
 
+// 0+ elementos separados por coma (permite vacío)
 CommaOpt<T>: Vec<T> = {
     <v:CommaPlus<T>> ","? => v,
     => vec![],
+};
+
+// 1+ con trailing comma opcional: devuelve (Vec<T>, trailing_comma_pos)
+CommaTrail1<T>: (Vec<T>, Option<Span>) = {
+    <v:CommaPlus<T>> <c:@L> "," => (v, Some(span1(c))),
+    <v:CommaPlus<T>> => (v, None),
+};
+
+// 0+ con trailing comma opcional: devuelve (Vec<T>, trailing_comma_pos)
+CommaTrail0<T>: (Vec<T>, Option<Span>) = {
+    => (vec![], None),
+    <t:CommaTrail1<T>> => t,
+};
+
+// Secuencia dentro de '{ ... }' separada por ';', permitiendo ';' vacíos.
+// Devuelve (items_en_orden_inverso, span_de_la_'}').
+// Nota: permite que el último item termine con '}' (sin ';').
+BraceBodySemi<Item>: (Vec<Item>, Span) = {
+    <rb:@L> "}" => (vec![], span1(rb)),
+    ";" <rest:BraceBodySemi<Item>> => rest,
+    <it:Item> ";" <rest:BraceBodySemi<Item>> => {
+        let (mut v, rb) = rest;
+        v.push(it);
+        (v, rb)
+    },
+    <it:Item> <rb:@L> "}" => (vec![it], span1(rb)),
 };
 
 // =============================================================================
@@ -39,9 +67,7 @@ IdentS: (Symbol, Span) = {
 #[inline] Ident: Symbol = { <t:IdentS> => t.0 };
 
 #[inline]
-IdentName: ast::IdentName = {
-    <t:IdentS> => ast::IdentName { sym: t.0, pos: t.1 }
-};
+IdentName: ast::IdentName = { <t:IdentS> => ast::IdentName { sym: t.0, pos: t.1 } };
 
 IdentNamePlus: Vec<ast::IdentName> = { <v:CommaPlus<IdentName>> => v };
 
@@ -72,13 +98,9 @@ pub SourceFile: ast::SourceFile = {
     }
 };
 
-ImportDecls: Vec<ast::TopLevelDecl> = {
-    <v:(<ImportDecl> ";")*> => v
-};
+ImportDecls: Vec<ast::TopLevelDecl> = { <v:(<ImportDecl> ";")*> => v };
 
-TopLevelDecls: ListRef<ast::TopLevelDecl> = {
-    <v:(<TopLevelDecl> ";")*> => arena.list_top_decls(v)
-};
+TopLevelDecls: ListRef<ast::TopLevelDecl> = { <v:(<TopLevelDecl> ";")*> => arena.list_top_decls(v) };
 
 // =============================================================================
 // 4. Declaraciones de Nivel Superior
@@ -88,8 +110,9 @@ TopLevelDecl: ast::TopLevelDecl = {
     <d:Declaration> => ast::TopLevelDecl::Decl(d),
     <f:FuncDecl>    => ast::TopLevelDecl::Func(f),
     <e:!> => {
+        let loc = recovery_loc(&e);
         errors.push(e);
-        let id = arena.decls.alloc(ast::Decl::Bad, Span::new(0, 0));
+        let id = arena.decls.alloc(ast::Decl::Bad, Span::new(loc, loc));
         ast::TopLevelDecl::Decl(id)
     }
 };
@@ -107,15 +130,16 @@ ImportDecl: ast::TopLevelDecl = {
         }), Span::new(start, end));
         ast::TopLevelDecl::Decl(id)
     },
-    <start:@L> "import" "(" <v:(<ImportSpec> ";")*> ")" <end:@R> => {
+
+    <start:@L> "import" <lp:@L> "(" <v:(<ImportSpec> ";")*> <rp:@L> ")" <end:@R> => {
         let specs = arena.list_specs(v.into_iter().map(ast::Spec::Import));
         let id = arena.decls.alloc(ast::Decl::Gen(ast::GenDecl {
             doc: None,
             kw_pos: Span::new(start, start + 6),
             kind: ast::GenDeclKind::Import,
-            l_paren: Some(span1(start + 6)),
+            l_paren: Some(span1(lp)),
             specs,
-            r_paren: Some(span1(end - 1)),
+            r_paren: Some(span1(rp)),
         }), Span::new(start, end));
         ast::TopLevelDecl::Decl(id)
     }
@@ -128,71 +152,73 @@ ImportSpec: ast::ImportSpec = {
 };
 
 ImportName: ast::ImportName = {
-    "." => ast::ImportName::Dot(Span::default()),
-    "_" => ast::ImportName::Blank(Span::default()),
-    <id:Ident> => ast::ImportName::Name(id, Span::default()),
+    <p:@L> "." => ast::ImportName::Dot(span1(p)),
+    <p:@L> "_" => ast::ImportName::Blank(span1(p)),
+    <t:IdentS> => ast::ImportName::Name(t.0, t.1),
 };
+
+// --- GenDecls con keyword adentro => kw_pos correcto (y menos glue) ---
 
 Declaration: ast::DeclId = {
-    "const" <v:ConstSpecList> => arena.decls.alloc(ast::Decl::Gen(v), Span::default()),
-    "var"   <v:VarSpecList>   => arena.decls.alloc(ast::Decl::Gen(v), Span::default()),
-    "type"  <v:TypeSpecList>  => arena.decls.alloc(ast::Decl::Gen(v), Span::default()),
+    <g:ConstDecl> => arena.decls.alloc(ast::Decl::Gen(g), Span::default()),
+    <g:VarDecl>   => arena.decls.alloc(ast::Decl::Gen(g), Span::default()),
+    <g:TypeDecl>  => arena.decls.alloc(ast::Decl::Gen(g), Span::default()),
 };
 
-ConstSpecList: ast::GenDecl = {
-    <spec:ConstSpec> => ast::GenDecl {
+ConstDecl: ast::GenDecl = {
+    <s:@L> "const" <spec:ConstSpec> <e:@R> => ast::GenDecl {
         doc: None,
-        kw_pos: Span::default(),
+        kw_pos: Span::new(s, s + 5),
         kind: ast::GenDeclKind::Const,
         l_paren: None,
         specs: arena.list_specs(std::iter::once(ast::Spec::Value(spec))),
         r_paren: None
     },
-    "(" <v:(<ConstSpec> ";")*> ")" => ast::GenDecl {
+    <s:@L> "const" <lp:@L> "(" <v:(<ConstSpec> ";")*> <rp:@L> ")" <e:@R> => ast::GenDecl {
         doc: None,
-        kw_pos: Span::default(),
+        kw_pos: Span::new(s, s + 5),
         kind: ast::GenDeclKind::Const,
-        l_paren: Some(Span::default()),
+        l_paren: Some(span1(lp)),
         specs: arena.list_specs(v.into_iter().map(ast::Spec::Value)),
-        r_paren: Some(Span::default())
+        r_paren: Some(span1(rp))
     }
 };
 
-VarSpecList: ast::GenDecl = {
-    <spec:VarSpec> => ast::GenDecl {
+VarDecl: ast::GenDecl = {
+    <s:@L> "var" <spec:VarSpec> <e:@R> => ast::GenDecl {
         doc: None,
-        kw_pos: Span::default(),
+        kw_pos: Span::new(s, s + 3),
         kind: ast::GenDeclKind::Var,
         l_paren: None,
         specs: arena.list_specs(std::iter::once(ast::Spec::Value(spec))),
         r_paren: None
     },
-    "(" <v:(<VarSpec> ";")*> ")" => ast::GenDecl {
+    <s:@L> "var" <lp:@L> "(" <v:(<VarSpec> ";")*> <rp:@L> ")" <e:@R> => ast::GenDecl {
         doc: None,
-        kw_pos: Span::default(),
+        kw_pos: Span::new(s, s + 3),
         kind: ast::GenDeclKind::Var,
-        l_paren: Some(Span::default()),
+        l_paren: Some(span1(lp)),
         specs: arena.list_specs(v.into_iter().map(ast::Spec::Value)),
-        r_paren: Some(Span::default())
+        r_paren: Some(span1(rp))
     }
 };
 
-TypeSpecList: ast::GenDecl = {
-    <spec:TypeSpec> => ast::GenDecl {
+TypeDecl: ast::GenDecl = {
+    <s:@L> "type" <spec:TypeSpec> <e:@R> => ast::GenDecl {
         doc: None,
-        kw_pos: Span::default(),
+        kw_pos: Span::new(s, s + 4),
         kind: ast::GenDeclKind::Type,
         l_paren: None,
         specs: arena.list_specs(std::iter::once(ast::Spec::Type(spec))),
         r_paren: None
     },
-    "(" <v:(<TypeSpec> ";")*> ")" => ast::GenDecl {
+    <s:@L> "type" <lp:@L> "(" <v:(<TypeSpec> ";")*> <rp:@L> ")" <e:@R> => ast::GenDecl {
         doc: None,
-        kw_pos: Span::default(),
+        kw_pos: Span::new(s, s + 4),
         kind: ast::GenDeclKind::Type,
-        l_paren: Some(Span::default()),
+        l_paren: Some(span1(lp)),
         specs: arena.list_specs(v.into_iter().map(ast::Spec::Type)),
-        r_paren: Some(Span::default())
+        r_paren: Some(span1(rp))
     }
 };
 
@@ -216,13 +242,13 @@ ValueSpecSuffix: (Option<ast::TypeId>, ListRef<ast::ExprId>) = {
 };
 
 TypeSpec: ast::TypeSpec = {
-    <s:@L> <id:Ident> <tp:TypeParameters?> <res:TypeSpecSuffix> <e:@R> => {
+    <s:@L> <name:IdentS> <tp:TypeParameters?> <res:TypeSpecSuffix> <e:@R> => {
         let (assign_pos, typ, alias) = res;
         ast::TypeSpec {
             span: Span::new(s, e),
             doc: None,
-            name: id,
-            name_pos: Span::default(),
+            name: name.0,
+            name_pos: name.1,
             type_params: tp,
             assign_pos,
             typ,
@@ -242,25 +268,25 @@ TypeSpecSuffix: (Option<Span>, ast::TypeId, bool) = {
 // =============================================================================
 
 FuncDecl: ast::FuncDeclId = {
-    <s:@L> "func" <r:Receiver?> <name:Ident> <tp:TypeParameters?> <sig:Signature> <body:Block> <e:@R> => {
+    <s:@L> "func" <r:Receiver?> <name:IdentS> <tp:TypeParameters?> <sig:Signature> <body:Block> <e:@R> => {
         arena.funcs.alloc(ast::FuncDecl {
             doc: None,
             func_pos: Span::new(s, s + 4),
             recv: r,
-            name,
-            name_pos: Span::default(),
+            name: name.0,
+            name_pos: name.1,
             func_type_params: tp,
             signature: sig,
             body: Some(body),
         }, Span::new(s, e))
     },
-    <s:@L> "func" <r:Receiver?> <name:Ident> <tp:TypeParameters?> <sig:Signature> ";" <e:@R> => {
+    <s:@L> "func" <r:Receiver?> <name:IdentS> <tp:TypeParameters?> <sig:Signature> ";" <e:@R> => {
         arena.funcs.alloc(ast::FuncDecl {
             doc: None,
             func_pos: Span::new(s, s + 4),
             recv: r,
-            name,
-            name_pos: Span::default(),
+            name: name.0,
+            name_pos: name.1,
             func_type_params: tp,
             signature: sig,
             body: None,
@@ -282,8 +308,6 @@ Receiver: ast::Receiver = {
 
 // =============================================================================
 // 6. Tipos y Genéricos
-//   Nota: en este stage NO se parsea instanciación `T[A]` dentro de NamedType.
-//         Se mantiene TypeParameters `[P any]` en decls/funcs.
 // =============================================================================
 
 Type: ast::TypeId = {
@@ -294,10 +318,7 @@ Type: ast::TypeId = {
     ),
 };
 
-TypeNoParen: ast::TypeId = {
-    NamedType,
-    TypeLit,
-};
+TypeNoParen: ast::TypeId = { NamedType, TypeLit };
 
 TypeNoIdentStart: ast::TypeId = {
     TypeLit,
@@ -308,16 +329,13 @@ TypeNoIdentStart: ast::TypeId = {
 };
 
 NamedType: ast::TypeId = {
-    // pkg.Name
     <s:@L> <pkg:IdentS> <dot:@L> "." <name:IdentS> <e:@R> => {
-        let (pkg_sym, pkg_pos) = pkg;
-        let (name_sym, name_pos) = name;
         arena.types.alloc(ast::Type::Named {
-            pkg: Some(pkg_sym),
-            pkg_pos: Some(pkg_pos),
+            pkg: Some(pkg.0),
+            pkg_pos: Some(pkg.1),
             dot_pos: Some(span1(dot)),
-            name: name_sym,
-            name_pos,
+            name: name.0,
+            name_pos: name.1,
             args_lbrack: None,
             args: ast::ListRef::EMPTY,
             args_trailing_comma: None,
@@ -325,15 +343,13 @@ NamedType: ast::TypeId = {
         }, Span::new(s, e))
     },
 
-    // Name
     <s:@L> <name:IdentS> <e:@R> => {
-        let (sym, name_pos) = name;
         arena.types.alloc(ast::Type::Named {
             pkg: None,
             pkg_pos: None,
             dot_pos: None,
-            name: sym,
-            name_pos,
+            name: name.0,
+            name_pos: name.1,
             args_lbrack: None,
             args: ast::ListRef::EMPTY,
             args_trailing_comma: None,
@@ -343,21 +359,13 @@ NamedType: ast::TypeId = {
 };
 
 TypeParameters: ast::TypeParamsId = {
-    <l:@L> "[" <params:CommaPlus<TypeParamDecl>> "]" <r:@R> => {
+    <l:@L> "[" <t:CommaTrail1<TypeParamDecl>> "]" <r:@R> => {
+        let (params, trailing) = t;
         let params = arena.list_type_param_decl_ids(params);
         arena.type_params.alloc(ast::TypeParams {
             l_brack: span1(l),
             params,
-            trailing_comma: None,
-            r_brack: span1(r - 1),
-        }, Span::new(l, r))
-    },
-    <l:@L> "[" <params:CommaPlus<TypeParamDecl>> <c:@L> "," "]" <r:@R> => {
-        let params = arena.list_type_param_decl_ids(params);
-        arena.type_params.alloc(ast::TypeParams {
-            l_brack: span1(l),
-            params,
-            trailing_comma: Some(span1(c)),
+            trailing_comma: trailing,
             r_brack: span1(r - 1),
         }, Span::new(l, r))
     }
@@ -372,25 +380,13 @@ TypeParamDecl: ast::TypeParamDeclId = {
 
 // -----------------------------------------------------------------------------
 // FIX (chan): canonical + “leftmost chan”
-//  - ChanType está factorizado en un no-terminal (evita duplicación estructural)
-//  - `chan T` usa ElementTypeNoRecv (T no puede empezar con `<-` sin paréntesis)
 // -----------------------------------------------------------------------------
 
 TypeLit: ast::TypeId = {
-    ArrayType,
-    SliceType,
-    StructType,
-    PointerType,
-    FunctionType,
-    InterfaceType,
-    MapType,
-    ChanType,
+    ArrayType, SliceType, StructType, PointerType, FunctionType, InterfaceType, MapType, ChanType
 };
 
-// `chan T` (bidir) NO permite T que empiece con `<-` directamente.
-// Para obtener `chan (<-chan int)` debes parentizar.
 ChanType: ast::TypeId = {
-    // <- chan T   (recv-only)
     <recv_pos:@L> "<-" <cp:@L> "chan" <t:Type> <e:@R> => arena.types.alloc(
         ast::Type::Chan {
             dir: ast::ChanDir::Recv,
@@ -402,7 +398,6 @@ ChanType: ast::TypeId = {
         Span::new(recv_pos, e)
     ),
 
-    // chan <- T   (send-only)
     <cp:@L> "chan" <ap:@L> "<-" <t:Type> <e:@R> => arena.types.alloc(
         ast::Type::Chan {
             dir: ast::ChanDir::Send,
@@ -414,7 +409,6 @@ ChanType: ast::TypeId = {
         Span::new(cp, e)
     ),
 
-    // chan T      (bidir)  --- T NO puede empezar con `<-`
     <cp:@L> "chan" <t:ElementTypeNoRecv> <e:@R> => arena.types.alloc(
         ast::Type::Chan {
             dir: ast::ChanDir::Both,
@@ -427,7 +421,6 @@ ChanType: ast::TypeId = {
     )
 };
 
-// ElementType para `chan T` que excluye el prefijo `<-` salvo que esté parentizado.
 ElementTypeNoRecv: ast::TypeId = {
     TypeNoRecv,
     <s:@L> "(" <t:Type> ")" <e:@R> => arena.types.alloc(
@@ -436,28 +429,13 @@ ElementTypeNoRecv: ast::TypeId = {
     ),
 };
 
-// “Type” sin el caso que empieza con `<-` (i.e., sin `<-chan T` directo).
-TypeNoRecv: ast::TypeId = {
-    NamedType,
-    TypeLitNoRecv,
-};
+TypeNoRecv: ast::TypeId = { NamedType, TypeLitNoRecv };
 
-// Igual que TypeLit, pero sin el caso `<- chan T` (recv-only).
-// Aquí sí permitimos `chan T` y `chan<- T`, pero `chan T` vuelve a usar ElementTypeNoRecv,
-// aplicando la misma regla recursivamente.
 TypeLitNoRecv: ast::TypeId = {
-    ArrayType,
-    SliceType,
-    StructType,
-    PointerType,
-    FunctionType,
-    InterfaceType,
-    MapType,
-    ChanTypeNoRecv,
+    ArrayType, SliceType, StructType, PointerType, FunctionType, InterfaceType, MapType, ChanTypeNoRecv
 };
 
 ChanTypeNoRecv: ast::TypeId = {
-    // chan <- T   (send-only)
     <cp:@L> "chan" <ap:@L> "<-" <t:Type> <e:@R> => arena.types.alloc(
         ast::Type::Chan {
             dir: ast::ChanDir::Send,
@@ -469,7 +447,6 @@ ChanTypeNoRecv: ast::TypeId = {
         Span::new(cp, e)
     ),
 
-    // chan T      (bidir)  --- T NO puede empezar con `<-`
     <cp:@L> "chan" <t:ElementTypeNoRecv> <e:@R> => arena.types.alloc(
         ast::Type::Chan {
             dir: ast::ChanDir::Both,
@@ -518,9 +495,8 @@ StructType: ast::TypeId = {
     }
 };
 
-// Consume la '}' y por eso NO es nullable de forma “global”.
-// Construye en orden inverso (push) y se revierte una vez en StructType.
-// Absorbe tag opcional + terminador (; o }) aquí => elimina reduce/shift con string_lit
+// StructBody se queda especializado porque “tag StringLit” es el sitio clásico de S/R.
+// Mantienes tu solución buena: absorber tag + terminador aquí.
 StructBody: (Vec<ast::FieldId>, Span) = {
     <rb:@L> "}" => (vec![], span1(rb)),
     ";" <rest:StructBody> => rest,
@@ -554,16 +530,7 @@ StructBody: (Vec<ast::FieldId>, Span) = {
     },
 };
 
-StructField: ast::FieldId = {
-    <core:FieldDeclCore> <tag:StringLit?> => {
-        let (mut f, sp) = core;
-        f.tag = tag;
-        arena.fields.alloc(f, sp)
-    }
-};
-
 FieldDeclCore: (ast::Field, Span) = {
-    // Named: 2+ names (commit al ver ',')
     <s:@L> <first:IdentName> "," <rest:CommaPlus<IdentName>> <t:Type> <e:@R> => {
         let mut names = Vec::with_capacity(1 + rest.len());
         names.push(first);
@@ -583,7 +550,6 @@ FieldDeclCore: (ast::Field, Span) = {
         )
     },
 
-    // Named: 1 name + Type
     <s:@L> <name:IdentName> <t:Type> <e:@R> => {
         let names = arena.list_ident_names(vec![name]);
         (
@@ -659,15 +625,9 @@ Signature: ast::SignatureId = {
     )
 };
 
-ResultOpt: Option<ast::Results> = {
-    <r:Result> => Some(r),
-    => None
-};
+ResultOpt: Option<ast::Results> = { <r:Result> => Some(r), => None };
 
-Result: ast::Results = {
-    Parameters => ast::Results::Params(<>),
-    TypeNoParen => ast::Results::Type(<>)
-};
+Result: ast::Results = { Parameters => ast::Results::Params(<>), TypeNoParen => ast::Results::Type(<>), };
 
 Parameters: ast::FieldList = {
     <l:@L> "(" ")" <r:@R> => ast::FieldList {
@@ -677,22 +637,13 @@ Parameters: ast::FieldList = {
         r_paren: span1(r - 1),
     },
 
-    <l:@L> "(" <p:CommaPlus<ParameterDecl>> ")" <r:@R> => {
+    <l:@L> "(" <t:CommaTrail1<ParameterDecl>> ")" <r:@R> => {
+        let (p, trailing) = t;
         let fields = resolve_param_list(arena, p);
         ast::FieldList {
             l_paren: span1(l),
             fields: arena.list_fields(fields),
-            trailing_comma: None,
-            r_paren: span1(r - 1),
-        }
-    },
-
-    <l:@L> "(" <p:CommaPlus<ParameterDecl>> <c:@L> "," ")" <r:@R> => {
-        let fields = resolve_param_list(arena, p);
-        ast::FieldList {
-            l_paren: span1(l),
-            fields: arena.list_fields(fields),
-            trailing_comma: Some(span1(c)),
+            trailing_comma: trailing,
             r_paren: span1(r - 1),
         }
     }
@@ -752,20 +703,11 @@ InterfaceType: ast::TypeId = {
     }
 };
 
-InterfaceBody: (Vec<ast::InterfaceElem>, Span) = {
-    <rb:@L> "}" => (vec![], span1(rb)),
-    ";" <rest:InterfaceBody> => rest,
-    <el:InterfaceElem> ";" <rest:InterfaceBody> => {
-        let (mut v, rb) = rest;
-        v.push(el);
-        (v, rb)
-    },
-    <el:InterfaceElem> <rb:@L> "}" => (vec![el], span1(rb)),
-};
+InterfaceBody: (Vec<ast::InterfaceElem>, Span) = { <b:BraceBodySemi<InterfaceElem>> => b };
 
 InterfaceElem: ast::InterfaceElem = {
-    <s:@L> <name:Ident> <sig:Signature> <e:@R> =>
-        ast::InterfaceElem::Method { span: Span::new(s, e), name, name_pos: Span::default(), sig },
+    <s:@L> <name:IdentS> <sig:Signature> <e:@R> =>
+        ast::InterfaceElem::Method { span: Span::new(s, e), name: name.0, name_pos: name.1, sig },
 
     <s:@L> <elem:TypeElem> <e:@R> =>
         ast::InterfaceElem::TypeElem { span: Span::new(s, e), elem }
@@ -782,7 +724,6 @@ TypeElem: ast::TypeElem = {
     }
 };
 
-// Unión estilo CommaPlus: no ε-tail => elimina reduce/shift en '|'
 TypeUnion: (Vec<ast::TypeTerm>, Vec<Span>) = {
     #[precedence(level="1")]
     <u:TypeUnion> <p:@L> "|" <t:TypeTerm> => {
@@ -794,7 +735,7 @@ TypeUnion: (Vec<ast::TypeTerm>, Vec<Span>) = {
     #[precedence(level="0")]
     <t:TypeTerm> => (vec![t], vec![]),
 };
- 
+
 TypeTerm: ast::TypeTerm = {
     <s:@L> <t:Type> <e:@R> => ast::TypeTerm::Type { span: Span::new(s, e), typ: t },
     <s:@L> "~" <t:Type> <e:@R> => ast::TypeTerm::Tilde { span: Span::new(s, e), tilde_pos: span1(s), typ: t }
@@ -814,7 +755,7 @@ MapType: ast::TypeId = {
 };
 
 // =============================================================================
-// 7. Sentencias y Expresiones (mínimo, sin '.' ni '[]' por ahora)
+// 7. Sentencias y Expresiones (mínimo)
 // =============================================================================
 
 Block: ast::Block = {
@@ -825,50 +766,30 @@ Block: ast::Block = {
     }
 };
 
-BlockBody: (Vec<ast::StmtId>, Span) = {
-    <rb:@L> "}" => (vec![], span1(rb)),
-    ";" <rest:BlockBody> => rest,
-
-    // return <exprlist> ';'
-    <s:@L> "return" <vals:ExprList> <e:@R> ";" <rest:BlockBody> => {
-        let stmt = arena.stmts.alloc(
-            ast::Stmt::Return { return_pos: Span::new(s, s + 6), results: vals },
-            Span::new(s, e)
-        );
-        let (mut v, rb) = rest;
-        v.push(stmt);
-        (v, rb)
-    },
-
-    // return ';'
-    <s:@L> "return" <e:@R> ";" <rest:BlockBody> => {
-        let stmt = arena.stmts.alloc(
-            ast::Stmt::Return { return_pos: Span::new(s, s + 6), results: ast::ListRef::EMPTY },
-            Span::new(s, e)
-        );
-        let (mut v, rb) = rest;
-        v.push(stmt);
-        (v, rb)
-    },
-
-    // return <exprlist> '}'
-    <s:@L> "return" <vals:ExprList> <e:@R> <rb:@L> "}" => {
-        let stmt = arena.stmts.alloc(
-            ast::Stmt::Return { return_pos: Span::new(s, s + 6), results: vals },
-            Span::new(s, e)
-        );
-        (vec![stmt], span1(rb))
-    },
-
-    // return '}'
-    <s:@L> "return" <e:@R> <rb:@L> "}" => {
-        let stmt = arena.stmts.alloc(
-            ast::Stmt::Return { return_pos: Span::new(s, s + 6), results: ast::ListRef::EMPTY },
-            Span::new(s, e)
-        );
-        (vec![stmt], span1(rb))
-    },
+// Item de statement para BlockBody (incluye recovery)
+Stmt: ast::StmtId = {
+    ReturnStmt,
+    <e:!> => {
+        let loc = recovery_loc(&e);
+        errors.push(e);
+        let sp = ast::Span::new(loc, loc);
+        arena.stmts.alloc(ast::Stmt::Bad(sp), sp)
+    }
 };
+
+ReturnStmt: ast::StmtId = {
+    <s:@L> "return" <vals:ExprList> <e:@R> => arena.stmts.alloc(
+        ast::Stmt::Return { return_pos: Span::new(s, s + 6), results: vals },
+        Span::new(s, e)
+    ),
+    <s:@L> "return" <e:@R> => arena.stmts.alloc(
+        ast::Stmt::Return { return_pos: Span::new(s, s + 6), results: ast::ListRef::EMPTY },
+        Span::new(s, e)
+    )
+};
+
+// BlockBody ahora es genérico: “items con ; o }”, y permite ';' vacíos.
+BlockBody: (Vec<ast::StmtId>, Span) = { <b:BraceBodySemi<Stmt>> => b };
 
 #[inline]
 ExprList: ListRef<ast::ExprId> = { <v:CommaPlus<Expr>> => arena.list_exprs(v) };
@@ -882,7 +803,7 @@ Expr: ast::ExprId = {
 };
 
 // =============================================================================
-// 8. Extern (TOKENS) - debe calzar con tu Tok<'input>
+// 8. Extern (TOKENS)
 // =============================================================================
 
 extern {
@@ -925,6 +846,7 @@ extern {
         "<-"         => Tok::Arrow,
         "="          => Tok::Assign,
         "..."        => Tok::Ellipsis,
-        "_"          => Tok::Ident("_"),
+
+        "_"          => Tok::Underscore,
     }
 }

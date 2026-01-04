@@ -17,6 +17,8 @@ fn injected_semis(input: &str) -> Vec<usize> {
 
 fn tok_name(t: &Tok<'_>) -> &'static str {
     match t {
+        Tok::Underscore => "_",
+
         Tok::Ident(_) => "IDENT",
         Tok::IntLit(_) => "INT",
         Tok::FloatLit(_) => "FLOAT",

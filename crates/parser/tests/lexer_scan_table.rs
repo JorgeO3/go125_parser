@@ -10,6 +10,8 @@ struct Expected {
 
 fn kind_name(t: &Tok<'_>) -> &'static str {
     match t {
+        Tok::Underscore => "Underscore",
+
         Tok::Ident(_) => "Ident",
         Tok::IntLit(_) => "IntLit",
         Tok::FloatLit(_) => "FloatLit",
