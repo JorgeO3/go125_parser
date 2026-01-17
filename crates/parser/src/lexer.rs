@@ -1,6 +1,9 @@
-use crate::error::{Diag, LexError, LexErrorKind};
-use logos::{Lexer as LogosLexer, Logos};
 use std::ops::Range;
+
+use logos::{Lexer as LogosLexer, Logos};
+use memchr::{memchr, memchr2, memmem};
+
+use crate::error::{Diag, LexError, LexErrorKind};
 
 // =============================================================================
 // Character Classification & Validation Utilities
@@ -61,30 +64,44 @@ pub const fn is_valid_unicode_scalar(x: u32) -> bool {
 /// Check if byte sequence is valid decimal digits with underscores
 #[inline(always)]
 const fn is_decimal_digits_with_underscores(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
+    let len = bytes.len();
+
+    // Validación inicial: no vacío, debe empezar y terminar con dígito
+    if len == 0 {
         return false;
     }
-    let mut prev_was_digit = is_dec_digit(bytes[0]);
-    if !prev_was_digit {
+
+    let (first, rest) = match bytes.split_first() {
+        Some(pair) => pair,
+        None => return false,
+    };
+
+    let (last, middle) = match rest.split_last() {
+        Some(pair) => pair,
+        None => return is_dec_digit(*first), // Caso de un solo byte
+    };
+
+    if !is_dec_digit(*first) || !is_dec_digit(*last) {
         return false;
     }
-    let mut i = 1;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let is_digit = is_dec_digit(b);
-        if b == b'_' {
-            if !prev_was_digit || i + 1 >= bytes.len() || !is_dec_digit(bytes[i + 1]) {
-                return false;
+
+    // Validar sección media
+    let mut i = 0;
+    while i < middle.len() {
+        match middle[i] {
+            b'_' => {
+                // El siguiente debe ser dígito (sabemos que existe porque last es dígito)
+                if i + 1 >= middle.len() || !is_dec_digit(middle[i + 1]) {
+                    return false;
+                }
+                i += 2; // Saltar '_' y el dígito validado
             }
-            prev_was_digit = false;
-        } else if is_digit {
-            prev_was_digit = true;
-        } else {
-            return false;
+            b if is_dec_digit(b) => i += 1,
+            _ => return false,
         }
-        i += 1;
     }
-    prev_was_digit
+
+    true
 }
 
 // =============================================================================
@@ -114,8 +131,6 @@ impl Default for LexExtras {
 /// Scan block comment and cache newline position for semicolon insertion
 #[inline]
 fn lex_block_comment(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
-    use memchr::{memchr2, memmem};
-
     let rem = lex.remainder().as_bytes();
 
     if let Some(end_pos) = memmem::find(rem, b"*/") {
@@ -139,8 +154,6 @@ fn lex_block_comment(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKin
 /// Single-pass raw string scanner (backtick-delimited)
 #[inline]
 fn lex_raw_string(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
-    use memchr::memchr;
-
     let rem = lex.remainder().as_bytes();
 
     if let Some(pos) = memchr(b'`', rem) {
@@ -337,9 +350,7 @@ mod esc {
 
     /// Single-pass scan and validation for interpreted strings
     #[inline]
-    pub fn lex_interpreted_string(
-        lex: &mut LogosLexer<'_, super::RawTok>,
-    ) -> Result<(), LexErrorKind> {
+    pub fn lex_interpreted_string(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
         use EscCharClass as ECC;
         use EscState as ES;
 
@@ -679,7 +690,7 @@ mod rune {
 
     /// Single-pass scan and validation for rune literals
     #[inline]
-    pub fn lex_rune_lit(lex: &mut LogosLexer<'_, super::RawTok>) -> Result<(), LexErrorKind> {
+    pub fn lex_rune_lit(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
         let rem = lex.remainder().as_bytes();
 
         if rem.is_empty() || rem[0] == b'\n' || rem[0] == b'\r' {
@@ -1003,7 +1014,7 @@ mod num {
     /// Maximal munch number scanner with integrated DFA classification
     /// Stores classification result in `lex.extras.num_info`: 0=invalid, 1=int, 2=float
     #[inline]
-    pub fn lex_number(lex: &mut LogosLexer<'_, super::RawTok>) -> Result<(), LexErrorKind> {
+    pub fn lex_number(lex: &mut LogosLexer<'_, RawTok>) -> Result<(), LexErrorKind> {
         lex.extras.num_info = 0;
 
         let src = lex.source().as_bytes();
@@ -1321,7 +1332,7 @@ impl RawTok {
     /// Convert raw token to public token representation
     #[inline]
     #[rustfmt::skip]
-    const fn to_token<'src>(self, slice: &'src str) -> Tok<'src> {
+    const fn to_token(self, slice: &str) -> Tok<'_> {
         if matches!(self.kind(), TokKind::Literal) {
             return match self {
                 Self::Ident => Tok::Ident(slice),

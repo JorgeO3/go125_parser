@@ -64,7 +64,8 @@ IdentS: (Symbol, Span) = {
     <l:@L> <s:"ident"> <r:@R> => (interner.intern(s), Span::new(l, r)),
 };
 
-#[inline] Ident: Symbol = { <t:IdentS> => t.0 };
+#[inline] 
+Ident: Symbol = { <t:IdentS> => t.0 };
 
 #[inline]
 IdentName: ast::IdentName = { <t:IdentS> => ast::IdentName { sym: t.0, pos: t.1 } };
